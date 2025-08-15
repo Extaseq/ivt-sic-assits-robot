@@ -1,72 +1,66 @@
-#include <librealsense2/rs.hpp>
-#include <opencv2/opencv.hpp>
 #include <iostream>
+#include <fcntl.h>      // open
+#include <termios.h>    // struct termios
+#include <unistd.h>     // write, read, sleep
+#include <cstring>      // strlen
 
-static cv::Mat frame_to_mat(const rs2::video_frame& f) {
-    int width = f.get_width();
-    int height = f.get_height();
-    if (f.get_profile().format() == RS2_FORMAT_BGR8) {
-        return cv::Mat(cv::Size(width, height), CV_8UC3, (void*)f.get_data(), cv::Mat::AUTO_STEP);
-    } else if (f.get_profile().format() == RS2_FORMAT_RGB8) {
-        cv::Mat rgb(cv::Size(width, height), CV_8UC3, (void*)f.get_data(), cv::Mat::AUTO_STEP);
-        cv::Mat bgr; cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
-        return bgr;
-    } else if (f.get_profile().format() == RS2_FORMAT_Y8) {
-        return cv::Mat(cv::Size(width, height), CV_8UC1, (void*)f.get_data(), cv::Mat::AUTO_STEP);
+int main() {
+    const char* port = "/dev/ttyTHS1";   // Cổng UART Jetson
+    int serial_port = open(port, O_RDWR);
+
+    if (serial_port < 0) {
+        std::cerr << "Không mở được " << port << std::endl;
+        return 1;
     }
-    throw std::runtime_error("Unsupported frame format!");
-}
 
-int main() try {
-    const int W = 640, H = 480, FPS = 60;
+    // Cấu hình UART
+    struct termios tty;
+    if (tcgetattr(serial_port, &tty) != 0) {
+        std::cerr << "Lỗi: Không lấy được cấu hình UART\n";
+        close(serial_port);
+        return 1;
+    }
 
-    rs2::pipeline pipe;
-    rs2::config cfg;
-    cfg.enable_stream(RS2_STREAM_COLOR, W, H, RS2_FORMAT_BGR8, FPS);
-    cfg.enable_stream(RS2_STREAM_DEPTH, W, H, RS2_FORMAT_Z16, FPS);
+    // Thiết lập baudrate = 9600
+    cfsetospeed(&tty, B9600);
+    cfsetispeed(&tty, B9600);
 
-    auto profile = pipe.start(cfg);
+    // 8N1 (8 data bits, no parity, 1 stop bit)
+    tty.c_cflag &= ~PARENB; // tắt parity
+    tty.c_cflag &= ~CSTOPB; // 1 stop bit
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;     // 8 data bits
 
-    rs2::align align_to_color(RS2_STREAM_COLOR);
+    tty.c_cflag &= ~CRTSCTS;        // tắt flow control
+    tty.c_cflag |= CREAD | CLOCAL;  // bật receiver, bỏ modem control
 
-    float depth_scale = profile.get_device().first<rs2::depth_sensor>().get_depth_scale();
+    tty.c_lflag &= ~ICANON;
+    tty.c_lflag &= ~ECHO;
+    tty.c_lflag &= ~ECHOE;
+    tty.c_lflag &= ~ECHONL;
+    tty.c_lflag &= ~ISIG; // tắt Ctrl-C/Z
 
-    rs2::colorizer depth_colorizer;
+    tty.c_iflag &= ~(IXON | IXOFF | IXANY); // tắt software flow control
+    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
 
-    std::cout << "Press [ESC] to quit.\n";
+    tty.c_oflag &= ~OPOST;
+    tty.c_oflag &= ~ONLCR;
+
+    // Áp dụng cấu hình
+    if (tcsetattr(serial_port, TCSANOW, &tty) != 0) {
+        std::cerr << "Lỗi: Không set được UART config\n";
+        close(serial_port);
+        return 1;
+    }
+
+    std::cout << "Đang gửi dữ liệu tới Arduino qua UART..." << std::endl;
 
     while (true) {
-        rs2::frameset fs = pipe.wait_for_frames();
-        fs = align_to_color.process(fs);
-
-        rs2::video_frame color = fs.get_color_frame();
-        rs2::depth_frame depth = fs.get_depth_frame();
-        rs2::video_frame depth_color = depth_colorizer.process(depth);
-
-        cv::Mat color_mat = frame_to_mat(color);
-        cv::Mat depth_color_mat = frame_to_mat(depth_color);
-
-        int cx = color_mat.cols / 2, cy = color_mat.rows / 2;
-        float dist_m = depth.get_distance(cx, cy);
-
-        cv::circle(color_mat, {cx, cy}, 4,  {0, 255, 0}, -1);
-        char text[64];
-        std::snprintf(text, sizeof(text), "%.2f m", dist_m);
-        cv::putText(color_mat, text, {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 1.0, {0, 255, 0}, 2);
-
-        cv::imshow("Color (BGR)", color_mat);
-        cv::imshow("Depth (colorized)", depth_color_mat);
-
-        int k = cv::waitKey(1);
-        if (k == 27) break;
+        const char* msg = "m\n";
+        write(serial_port, msg, strlen(msg));
+        sleep(1);
     }
 
-    pipe.stop();
+    close(serial_port);
     return 0;
-} catch (const rs2::error& e) {
-    std::cerr << "RealSense error: " << e.what() << "\n";
-    return 1;
-} catch (const std::exception& e) {
-    std::cerr << "Std error: " << e.what() << "\n";
-    return 2;
 }
