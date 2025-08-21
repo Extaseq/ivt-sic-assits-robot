@@ -38,8 +38,10 @@ public:
         vR = clamp(vR, -speed_limit_, speed_limit_);
 
         if (slew_rate_ > 0.0f) {
-            vL = clamp(vL, prev_vL_ - slew_rate_, prev_vL_ + slew_rate_);
-            vR = clamp(vR, prev_vR_ - slew_rate_, prev_vR_ + slew_rate_);
+            // slew_rate_ is specified in units per second, so scale by dt_
+            float max_delta = slew_rate_ * dt_;
+            vL = clamp(vL, prev_vL_ - max_delta, prev_vL_ + max_delta);
+            vR = clamp(vR, prev_vR_ - max_delta, prev_vR_ + max_delta);
         }
 
         prev_error_ = error;
