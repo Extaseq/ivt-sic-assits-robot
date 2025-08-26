@@ -81,65 +81,64 @@ try
                 }
             }
         }
-    }
 
-    // Lọc morphology như cũ (có thể giữ nguyên kernel 5x5 và 2 lần closing)
-    Mat k = getStructuringElement(MORPH_RECT, Size(5, 5));
-    morphologyEx(mask, mask, MORPH_CLOSE, k, Point(-1, -1), 2);
+        // Lọc morphology như cũ (có thể giữ nguyên kernel 5x5 và 2 lần closing)
+        Mat k = getStructuringElement(MORPH_RECT, Size(5, 5));
+        morphologyEx(mask, mask, MORPH_CLOSE, k, Point(-1, -1), 2);
 
-    std::vector<std::vector<Point>> contours;
-    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+        std::vector<std::vector<Point>> contours;
+        findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-    float vL = 0.0f, vR = 0.0f;
-    if (contours.empty())
-    { // Lost line
-        vL = -0.15f;
-        vR = 0.15f;
-        std::cout << "MISS; MOTOR " << vL << " " << vR << "\n";
-    }
-    else
-    {
-        auto cmax = *std::max_element(contours.begin(), contours.end(),
-                                      [](auto &a, auto &b)
-                                      { return contourArea(a) < contourArea(b); });
-        Moments M = moments(cmax);
-        if (M.m00 >= 1e-3)
-        {
-            int cx = int(M.m10 / M.m00);
-
-            std::pair<float, float> motor_speeds = follower.update(cx, centerX);
-            vL = motor_speeds.first;
-            vR = motor_speeds.second;
-
-            float err = float(cx - centerX);
-            std::cout << "OK; ERR=" << int(err)
-                      << " | MOTOR " << vL << " " << vR << "\n";
+        float vL = 0.0f, vR = 0.0f;
+        if (contours.empty())
+        { // Lost line
+            vL = -0.15f;
+            vR = 0.15f;
+            std::cout << "MISS; MOTOR " << vL << " " << vR << "\n";
         }
         else
         {
-            vL = -0.15f;
-            vR = 0.15f;
-            std::cout << "MISS(m00); MOTOR " << vL << " " << vR << "\n";
+            auto cmax = *std::max_element(contours.begin(), contours.end(),
+                                          [](auto &a, auto &b)
+                                          { return contourArea(a) < contourArea(b); });
+            Moments M = moments(cmax);
+            if (M.m00 >= 1e-3)
+            {
+                int cx = int(M.m10 / M.m00);
+
+                std::pair<float, float> motor_speeds = follower.update(cx, centerX);
+                vL = motor_speeds.first;
+                vR = motor_speeds.second;
+
+                float err = float(cx - centerX);
+                std::cout << "OK; ERR=" << int(err)
+                          << " | MOTOR " << vL << " " << vR << "\n";
+            }
+            else
+            {
+                vL = -0.15f;
+                vR = 0.15f;
+                std::cout << "MISS(m00); MOTOR " << vL << " " << vR << "\n";
+            }
         }
+
+        // TODO: Send vL and vR to motors here
+        (void)vL; // Suppress unused variable warning
+        (void)vR; // Suppress unused variable warning
+
+        imshow("mask", mask);
+        imshow("color", bgr);
+
+        if (waitKey(1) == 27)
+        {
+            break;
+        }
+
+        std::this_thread::sleep_until(next_tick);
     }
 
-    // TODO: Send vL and vR to motors here
-    (void)vL; // Suppress unused variable warning
-    (void)vR; // Suppress unused variable warning
-
-    imshow("mask", mask);
-    imshow("color", bgr);
-
-    if (waitKey(1) == 27)
-    {
-        break;
-    }
-
-    std::this_thread::sleep_until(next_tick);
-}
-
-pipe.stop();
-return 0;
+    pipe.stop();
+    return 0;
 }
 catch (const rs2::error &e)
 {
