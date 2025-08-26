@@ -60,6 +60,10 @@ try
         }
 
         Mat bgr(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color.get_data(), Mat::AUTO_STEP);
+        // Đường tham chiếu: đường giữa ảnh & ranh giới ROI
+        cv::line(bgr, Point(WIDTH / 2, 0), Point(WIDTH / 2, HEIGHT - 1), Scalar(255, 255, 0), 1, LINE_AA);
+        cv::line(bgr, Point(0, ROI_TOP), Point(WIDTH - 1, ROI_TOP), Scalar(200, 200, 200), 1, LINE_AA);
+
         // ==== BGR-based mask: Blue-dominant ====
         const int T = 30;    // biên chênh: B phải lớn hơn R/G ít nhất T
         const int Vmin = 60; // ngưỡng “độ sáng” tối thiểu (max(B,G,R))
@@ -105,6 +109,29 @@ try
             if (M.m00 >= 1e-3)
             {
                 int cx = int(M.m10 / M.m00);
+                // ====== VẼ OVERLAY KHI BẮT ĐƯỢC LINE ======
+                float err = float(cx - centerX);
+
+                // vẽ contour lớn nhất
+                drawContours(bgr, std::vector<std::vector<Point>>{cmax}, -1, Scalar(0, 255, 0), 2, LINE_AA);
+
+                // vẽ đường dọc qua centroid trong ROI
+                cv::line(bgr, Point(cx, ROI_TOP), Point(cx, HEIGHT - 1), Scalar(0, 255, 255), 2, LINE_AA);
+
+                // đánh dấu centroid
+                cv::circle(bgr, Point(cx, std::max(ROI_TOP + 1, HEIGHT - 5)), 4, Scalar(0, 0, 255), -1, LINE_AA);
+
+                // vẽ minAreaRect (giúp nhìn hướng của vạch)
+                RotatedRect rr = minAreaRect(cmax);
+                Point2f verts[4];
+                rr.points(verts);
+                for (int i = 0; i < 4; ++i)
+                    line(bgr, verts[i], verts[(i + 1) % 4], Scalar(0, 180, 255), 2, LINE_AA);
+
+                // in thông tin lỗi & tốc độ
+                char buf[128];
+                snprintf(buf, sizeof(buf), "cx=%d  err=%d  vL=%.2f vR=%.2f", cx, int(err), vL, vR);
+                putText(bgr, buf, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(50, 220, 50), 2, LINE_AA);
 
                 std::pair<float, float> motor_speeds = follower.update(cx, centerX);
                 vL = motor_speeds.first;
