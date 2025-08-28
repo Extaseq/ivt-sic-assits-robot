@@ -12,30 +12,66 @@
 using namespace cv;
 using namespace std;
 
-// ==================== UART Communication ====================
-int open_uart(const char *dev = "/dev/ttyTHS1", int baud = 115200)
+int open_uart(const char *dev = "/dev/ttyACM0", int baud = 115200)
 {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0)
-        return -1;
+    {
+        std::cerr << "Failed to open " << dev << ". Trying alternatives..." << std::endl;
+
+        // Thử các device khác
+        const char *alternatives[] = {"/dev/ttyUSB0", "/dev/ttyTHS1", "/dev/ttyAMA0"};
+        for (const char *alt_dev : alternatives)
+        {
+            fd = open(alt_dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+            if (fd >= 0)
+            {
+                std::cout << "Connected to " << alt_dev << std::endl;
+                break;
+            }
+        }
+
+        if (fd < 0)
+        {
+            std::cerr << "Could not open any UART device" << std::endl;
+            return -1;
+        }
+    }
 
     termios tio{};
     if (tcgetattr(fd, &tio) != 0)
+    {
+        close(fd);
         return -1;
+    }
+
+    // Cấu hình serial port
     cfmakeraw(&tio);
-
-    tio.c_cflag &= ~PARENB;
-    tio.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~PARENB; // No parity
+    tio.c_cflag &= ~CSTOPB; // 1 stop bit
     tio.c_cflag &= ~CSIZE;
-    tio.c_cflag |= CS8;
-    tio.c_cflag |= (CLOCAL | CREAD);
+    tio.c_cflag |= CS8;      // 8 data bits
+    tio.c_cflag &= ~CRTSCTS; // No hardware flow control
+    tio.c_cflag |= CREAD | CLOCAL;
 
+    tio.c_cc[VMIN] = 0;
+    tio.c_cc[VTIME] = 10; // Timeout in deciseconds
+
+    // Set baud rate
     speed_t spd = B115200;
     cfsetispeed(&tio, spd);
     cfsetospeed(&tio, spd);
 
     if (tcsetattr(fd, TCSANOW, &tio) != 0)
+    {
+        close(fd);
         return -1;
+    }
+
+    // Clear buffer
+    tcflush(fd, TCIOFLUSH);
+
+    std::cout << "UART opened successfully: " << dev << std::endl;
     return fd;
 }
 
@@ -43,14 +79,21 @@ void send_motor_command(int fd, const char *id, int speed)
 {
     if (fd < 0)
         return;
-    if (speed > 255)
-        speed = 255;
-    if (speed < -255)
-        speed = -255;
+
+    speed = std::max(-255, std::min(255, speed));
 
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%s %d\n", id, speed);
-    write(fd, buf, n);
+
+    ssize_t bytes_written = write(fd, buf, n);
+    if (bytes_written != n)
+    {
+        std::cerr << "UART write error: " << bytes_written << " bytes written, expected " << n << std::endl;
+    }
+
+    // Đảm bảo dữ liệu được gửi hoàn toàn
+    tcdrain(fd);
+    usleep(10000); // 10ms delay
 }
 
 void drive_motors(int fd, float left_speed, float right_speed)
@@ -193,16 +236,27 @@ BallResult detect_ball(const Mat &frame, const Mat &depth_frame,
 int main()
 {
     // UART setup
-    int uart_fd = open_uart("/dev/ttyTHS1", 115200);
-    if (uart_fd < 0)
-    {
-        cerr << "Failed to open UART. Using USB fallback..." << endl;
-        uart_fd = open_uart("/dev/ttyUSB0", 115200);
-    }
+    int uart_fd = open_uart("/dev/ttyACM0", 115200);
 
     if (uart_fd < 0)
     {
-        cerr << "Warning: Could not open UART. Motor commands will be simulated." << endl;
+        std::cerr << "Warning: UART not available. Running in simulation mode." << std::endl;
+    }
+    else
+    {
+        std::cout << "UART connected successfully. Waiting for Arduino ready message..." << std::endl;
+
+        // Đợi Arduino khởi động
+        sleep(2);
+
+        // Đọc message từ Arduino
+        char buffer[256];
+        ssize_t bytes_read = read(uart_fd, buffer, sizeof(buffer) - 1);
+        if (bytes_read > 0)
+        {
+            buffer[bytes_read] = '\0';
+            std::cout << "Arduino: " << buffer;
+        }
     }
 
     // RealSense setup
