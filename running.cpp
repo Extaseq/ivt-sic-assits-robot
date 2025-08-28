@@ -2,11 +2,21 @@
 #include <opencv2/opencv.hpp>
 #include <chrono>
 #include <thread>
-#include <unistd.h> // write(), close() (Linux). Trên Windows thay bằng Win32 serial.
+#include <unistd.h> // open, write, close
 #include <fcntl.h>
 #include <termios.h>
+#include <cstdio>    // snprintf
+#include <algorithm> // std::clamp, std::max, std::min
+#include <cmath>     // std::round, M_PI
+#include <vector>
 
-// --- UART open trên Jetson ---
+#include "LineFollow.hpp"
+#include "BallDetection.hpp"
+
+using namespace cv;
+
+//==================== UART (Jetson Nano) ====================
+// J41 UART (3.3V): "/dev/ttyTHS1";  USB-UART: "/dev/ttyUSB0"
 int open_uart(const char *dev = "/dev/ttyTHS1", int baud = 115200)
 {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -14,86 +24,68 @@ int open_uart(const char *dev = "/dev/ttyTHS1", int baud = 115200)
         return -1;
 
     termios tio{};
-    tcgetattr(fd, &tio);
+    if (tcgetattr(fd, &tio) != 0)
+        return -1;
     cfmakeraw(&tio);
-    // set baud
-    speed_t spd = B115200; // bạn có thể map baud khác nếu cần
-    cfsetispeed(&tio, spd);
-    cfsetospeed(&tio, spd);
-    tio.c_cflag |= (CLOCAL | CREAD);
+
     // 8N1
     tio.c_cflag &= ~PARENB;
     tio.c_cflag &= ~CSTOPB;
     tio.c_cflag &= ~CSIZE;
     tio.c_cflag |= CS8;
+    tio.c_cflag |= (CLOCAL | CREAD);
 
-    tcsetattr(fd, TCSANOW, &tio);
+    // Baud
+    speed_t spd = B115200;
+    (void)baud; // giữ 115200 (khớp Arduino)
+    cfsetispeed(&tio, spd);
+    cfsetospeed(&tio, spd);
+
+    if (tcsetattr(fd, TCSANOW, &tio) != 0)
+        return -1;
     return fd;
 }
 
-// Map tốc độ [-1..1] -> [-255..255] và gửi theo giao thức UART
-int clamp255(float x)
+static inline int clamp255(float x)
 {
     if (x > 1)
         x = 1;
     if (x < -1)
         x = -1;
-    return int(std::round(x * 255));
+    return int(std::round(x * 255.0f));
 }
 
-void sendMotorCmd(int fd, const char *id, int spd)
+static inline void sendMotorCmd(int fd, const char *id, int spd)
 {
     if (fd < 0)
-        return; // nếu chưa mở UART thì bỏ qua
+        return;
+    if (spd > 255)
+        spd = 255;
+    if (spd < -255)
+        spd = -255;
     char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%s %d\n", id, spd);
+    int n = std::snprintf(buf, sizeof(buf), "%s %d\n", id, spd);
     (void)write(fd, buf, n);
 }
 
-void driveLR(int fd, float vL_norm, float vR_norm)
+static inline void driveLR(int fd, float vL_norm, float vR_norm)
 {
     sendMotorCmd(fd, "M1", clamp255(vL_norm));
     sendMotorCmd(fd, "M2", clamp255(vR_norm));
 }
-void intake(int fd, int pwm)
-{ // pwm in [-255..255]
-    if (pwm > 255)
-        pwm = 255;
-    if (pwm < -255)
-        pwm = -255;
+
+static inline void intake(int fd, int pwm)
+{ // pwm ∈ [-255..255]
     sendMotorCmd(fd, "M3", pwm);
 }
 
-// Map tốc độ [-1..1] -> [-255..255] và gửi theo giao thức UART
-int clamp255(float x)
-{
-    if (x > 1)
-        x = 1;
-    if (x < -1)
-        x = -1;
-    return int(std::round(x * 255));
-}
-
-void sendMotorCmd(int fd, const char *id, int spd)
-{
-    if (fd < 0)
-        return; // nếu chưa mở UART thì bỏ qua
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%s %d\n", id, spd);
-    (void)write(fd, buf, n);
-}
-
-#include "LineFollow.hpp"
-#include "BallDetection.hpp" // lớp bạn có: trả về primary ball (angle, dist, score,...)
-
-using namespace cv;
-
+//==================== State machine ====================
 enum State
 {
     FOLLOW_LINE,
     BALL_SEEN,
     APPROACH_BALL,
-    INTAKE,
+    INTAKE_STATE,
     RELOCK_LINE
 };
 
@@ -102,62 +94,24 @@ static const int ROI_TOP = HEIGHT * 2 / 3;
 static const float DT = 0.02f; // 20ms
 static const auto CONTROL_DT = std::chrono::milliseconds(20);
 
-// Ngưỡng cho bóng (tùy bộ detect của bạn)
+// Ngưỡng phát hiện bóng / điều khiển
 static const float Smin = 0.55f;
 static const float D_detect_max = 2.5f; // m
-static const int N_detect_hold = 3;     // cần thấy liên tiếp
+static const int N_detect_hold = 3;     // thấy liên tiếp
 
-// Áp sát & intake
-static const float D_intake_on = 0.45f; // m: bật M3
-static const float D_captured = 0.25f;  // m: coi như đã vào miệng
-static const int INTAKE_PWM = 220;      // lực cuốn
+static const float D_captured = 0.25f; // coi như đã vào miệng
+static const int INTAKE_PWM = 220;     // lực cuốn
+static const int LINE_OK_HOLD = 4;
 
-// Tìm lại line
-static const int LINE_OK_HOLD = 4; // số khung có line để coi là relock ok
-
-// UART helpers (Linux/Jetson; Windows đổi API)
-int open_uart(const char *dev = "/dev/ttyUSB0", int baud = 115200)
-{
-    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd < 0)
-        return -1;
-    termios tio{};
-    tcgetattr(fd, &tio);
-    cfmakeraw(&tio);
-    cfsetspeed(&tio, B115200);
-    tio.c_cflag |= (CLOCAL | CREAD);
-    tcsetattr(fd, TCSANOW, &tio);
-    return fd;
-}
-int clamp255(float x)
-{
-    if (x > 1)
-        x = 1;
-    if (x < -1)
-        x = -1;
-    return int(std::round(x * 255));
-}
-void sendMotorCmd(int fd, const char *id, int spd)
-{
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%s %d\n", id, spd);
-    write(fd, buf, n);
-}
-void driveLR(int fd, float vL, float vR)
-{
-    sendMotorCmd(fd, "M1", clamp255(vL));
-    sendMotorCmd(fd, "M2", clamp255(vR));
-}
-void intake(int fd, int pwm) { sendMotorCmd(fd, "M3", std::max(-255, std::min(255, pwm))); }
+static inline float rad2deg(float r) { return r * 180.0f / (float)M_PI; }
 
 int main()
 {
     // --- Serial to Arduino ---
-    int uart = open_uart("/dev/ttyUSB0", 115200); // sửa port cho đúng máy bạn
+    // Đổi sang "/dev/ttyUSB0" nếu dùng USB-UART
+    int uart = open_uart("/dev/ttyTHS1", 115200);
     if (uart < 0)
-    {
-        perror("UART"); /* vẫn cho chạy demo hình ảnh */
-    }
+        perror("UART open failed");
 
     // --- RealSense ---
     rs2::pipeline pipe;
@@ -166,9 +120,40 @@ int main()
     cfg.enable_stream(RS2_STREAM_DEPTH, WIDTH, HEIGHT, RS2_FORMAT_Z16, FPS);
     auto profile = pipe.start(cfg);
 
-    // Detector & follower
+    // === Intrinsics & depth scale ===
+    auto color_vsp = profile.get_stream(RS2_STREAM_COLOR).as<rs2::video_stream_profile>();
+    rs2_intrinsics K = color_vsp.get_intrinsics();
+    float fx = K.fx, ppx = K.ppx;
+
+    rs2::device dev = profile.get_device();
+    float depth_scale = 0.001f;
+    if (dev.first<rs2::depth_sensor>())
+    {
+        auto ds = dev.first<rs2::depth_sensor>();
+        depth_scale = ds.get_depth_scale(); // mét / tick
+    }
+
+    // --- Detector params & init ---
+    ball::Params bp;
+    // HSV bóng tennis (vàng-xanh)
+    bp.hsv_low = Scalar(20, 80, 120);
+    bp.hsv_high = Scalar(45, 255, 255);
+    // Bỏ 30% phía trên ảnh để bớt nhiễu
+    bp.roi_top_frac = 0.30f;
+    // Hysteresis cho cửa sổ bắt bóng
+    bp.z_cap_on = 0.45f;
+    bp.z_cap_off = 0.55f;
+    bp.th_cap_on_rad = 8.0f * (float)M_PI / 180.0f;
+    bp.th_cap_off_rad = 10.0f * (float)M_PI / 180.0f;
+    bp.roi_cap_on_frac = 0.60f;
+    bp.roi_cap_off_frac = 0.55f;
+    bp.debounce_on_frames = 3;
+    bp.debounce_off_frames = 2;
+    // Giữ scoring/lock mặc định
+    ball::Detector det(bp);
+
+    // --- Line follower ---
     LineFollower follower(0.015f, 0.0f, 0.004f, 0.25f, DT);
-    ball::Detector det(/*tham số của bạn*/);
 
     State st = FOLLOW_LINE;
     int seen_hold = 0, line_ok_hold = 0;
@@ -195,7 +180,7 @@ int main()
 
         Mat bgr(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color.get_data(), Mat::AUTO_STEP);
 
-        // ---- LINE MASK (B-dominant, đơn giản) ----
+        // ---- LINE MASK (Blue-dominant) ----
         Mat mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
         const int T = 30, Vmin = 60;
         for (int y = ROI_TOP; y < HEIGHT; ++y)
@@ -204,32 +189,37 @@ int main()
             uchar *mrow = mask.ptr<uchar>(y);
             for (int x = 0; x < WIDTH; ++x)
             {
-                int B = row[x][0], G = row[x][1], R = row[x][2], V = std::max({B, G, R});
+                int B = row[x][0], G = row[x][1], R = row[x][2];
+                int V = std::max({B, G, R});
                 if (B > G + T && B > R + T && V >= Vmin)
                     mrow[x] = 255;
             }
         }
-        morphologyEx(mask, mask, MORPH_CLOSE, getStructuringElement(MORPH_RECT, {5, 5}), Point(-1, -1), 2);
+        morphologyEx(mask, mask, MORPH_CLOSE,
+                     getStructuringElement(MORPH_RECT, {5, 5}), Point(-1, -1), 2);
 
-        // ---- Find centroid of largest contour (line) ----
+        // ---- Centroid line ----
         std::vector<std::vector<Point>> contours;
         findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
         int centerX = WIDTH / 2;
         int cx_line = -1;
         if (!contours.empty())
         {
-            auto cmax = *std::max_element(contours.begin(), contours.end(), [](auto &a, auto &b)
-                                          { return contourArea(a) < contourArea(b); });
+            auto cmax = *std::max_element(
+                contours.begin(), contours.end(),
+                [](auto &a, auto &b)
+                { return contourArea(a) < contourArea(b); });
             Moments M = moments(cmax);
             if (M.m00 >= 1e-3)
                 cx_line = int(M.m10 / M.m00);
         }
 
-        // ---- Ball detection (dùng API trong BallDetection.hpp của bạn) ----
-        ball::Result r = det.detect(bgr, depth); // giả định: r.valid, r.dist_m, r.angle_deg, r.score
+        // ---- Ball detection ----
+        std::vector<ball::Candidate> cands; // optional, để vẽ debug
+        ball::Result r = det.detect(bgr, depth, fx, ppx, depth_scale, &cands);
 
         // ---- State machine ----
-        float vL = 0, vR = 0; // tốc độ chuẩn hoá [-1..1]
+        float vL = 0.0f, vR = 0.0f; // [-1..1]
         switch (st)
         {
         case FOLLOW_LINE:
@@ -237,9 +227,9 @@ int main()
             if (cx_line >= 0)
             {
                 line_ok_hold = std::min(LINE_OK_HOLD, line_ok_hold + 1);
-                auto [l, r] = follower.update(cx_line, centerX);
-                vL = l;
-                vR = r;
+                auto lr = follower.update(cx_line, centerX);
+                vL = lr.first;
+                vR = lr.second;
             }
             else
             {
@@ -247,13 +237,10 @@ int main()
                 vL = -0.18f;
                 vR = 0.18f; // quay tìm line
             }
-            // thấy bóng đủ tốt?
-            if (r.valid && r.score > Smin && r.dist_m < D_detect_max)
+            if (r.found && r.score > Smin && r.distance_m > 0.0f && r.distance_m < D_detect_max)
             {
                 if (++seen_hold >= N_detect_hold)
-                {
                     st = BALL_SEEN;
-                }
             }
             else
                 seen_hold = 0;
@@ -261,41 +248,39 @@ int main()
         }
         case BALL_SEEN:
         {
-            // chốt chuyển ngay sang tiếp cận, dừng intake (chưa bật)
             seen_hold = 0;
             st = APPROACH_BALL;
             break;
         }
         case APPROACH_BALL:
         {
-            if (r.valid)
+            if (r.found)
             {
-                // điều khiển “góc-lái, tiến-chậm theo khoảng cách”
-                float ang = r.angle_deg;                                      // >0 nghĩa là bóng nằm bên phải
-                float omega = std::clamp(ang / 30.0f, -0.8f, 0.8f);           // quay theo góc
-                float fwd = std::clamp((r.dist_m - 0.3f) / 0.8f, 0.2f, 0.6f); // tiến tới, chậm dần
+                float omega = std::clamp(r.angle_rad / (30.0f * (float)M_PI / 180.0f), -0.8f, 0.8f); // 30°
+                float fwd = std::clamp((r.distance_m - 0.3f) / 0.8f, 0.2f, 0.6f);
                 vL = std::clamp(fwd - 0.6f * omega, -0.8f, 0.8f);
                 vR = std::clamp(fwd + 0.6f * omega, -0.8f, 0.8f);
-                if (uart >= 0 && r.dist_m < D_intake_on)
+
+                // Bật intake theo cửa sổ capture (đã có hysteresis + debounce)
+                if (uart >= 0 && r.in_capture_win)
                     intake(uart, +INTAKE_PWM);
-                if (r.dist_m < D_captured)
+
+                if (r.very_close || (r.distance_m > 0.f && r.distance_m < D_captured))
                 {
-                    st = INTAKE;
+                    st = INTAKE_STATE;
                 }
             }
             else
             {
-                // mất bóng: quét tại chỗ
                 vL = -0.15f;
-                vR = 0.15f;
+                vR = 0.15f; // quét tìm lại bóng
             }
             break;
         }
-        case INTAKE:
+        case INTAKE_STATE:
         {
             if (uart >= 0)
                 intake(uart, +INTAKE_PWM);
-            // tiến nhẹ thêm 0.5s rồi sang relock line
             static auto t0 = std::chrono::steady_clock::now();
             static bool started = false;
             if (!started)
@@ -303,7 +288,7 @@ int main()
                 t0 = std::chrono::steady_clock::now();
                 started = true;
             }
-            vL = vR = 0.25f;
+            vL = vR = 0.25f; // “nuốt” thêm chút rồi quay lại line
             if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(500))
             {
                 started = false;
@@ -315,9 +300,9 @@ int main()
         {
             if (cx_line >= 0)
             {
-                auto [l, r] = follower.update(cx_line, centerX);
-                vL = l;
-                vR = r;
+                auto lr = follower.update(cx_line, centerX);
+                vL = lr.first;
+                vR = lr.second;
                 if (++line_ok_hold >= LINE_OK_HOLD)
                 {
                     st = FOLLOW_LINE;
@@ -328,31 +313,44 @@ int main()
             {
                 line_ok_hold = 0;
                 vL = -0.18f;
-                vR = 0.18f; // quay tìm line
+                vR = 0.18f;
             }
-            // tắt intake khi đã bắt đầu relock
             if (uart >= 0)
-                intake(uart, 0);
+                intake(uart, 0); // tắt cuốn khi đang tìm lại line
             break;
         }
         }
 
-        // ---- Gửi motor xuống Arduino ----
+        // ---- Gửi động cơ ----
         if (uart >= 0)
-        {
             driveLR(uart, vL, vR);
-        }
 
         // ---- Overlay debug ----
         line(bgr, {WIDTH / 2, 0}, {WIDTH / 2, HEIGHT - 1}, {255, 255, 0}, 1, LINE_AA);
         line(bgr, {0, ROI_TOP}, {WIDTH - 1, ROI_TOP}, {200, 200, 200}, 1, LINE_AA);
         if (cx_line >= 0)
-        {
             line(bgr, {cx_line, ROI_TOP}, {cx_line, HEIGHT - 1}, {0, 255, 255}, 2, LINE_AA);
+
+        // Vẽ top candidates (debug)
+        for (int i = 0; i < (int)cands.size(); ++i)
+        {
+            auto &cr = cands[i].r;
+            if (!cr.found)
+                continue;
+            circle(bgr, {cr.cx, cr.cy}, std::max(8, cr.radius_px),
+                   (i == 0 ? Scalar(0, 255, 0) : Scalar(0, 255, 255)), 2, LINE_AA);
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "#%d d=%.2f ang=%.1f sc=%.2f",
+                          i, cr.distance_m, rad2deg(cr.angle_rad), cands[i].score);
+            putText(bgr, buf, {cr.cx + 6, cr.cy - 6}, FONT_HERSHEY_SIMPLEX, 0.45,
+                    (i == 0 ? Scalar(0, 255, 0) : Scalar(0, 255, 255)), 1, LINE_AA);
         }
-        char txt[128];
-        snprintf(txt, sizeof(txt), "ST=%d  vL=%.2f vR=%.2f  ball:%s d=%.2fm ang=%.1f sc=%.2f",
-                 st, vL, vR, r.valid ? "Y" : "N", r.dist_m, r.angle_deg, r.score);
+
+        char txt[180];
+        std::snprintf(txt, sizeof(txt),
+                      "ST=%d vL=%.2f vR=%.2f  ball:%s d=%.2f ang=%.1f sc=%.2f cap:%d close:%d",
+                      st, vL, vR, r.found ? "Y" : "N", r.distance_m,
+                      rad2deg(r.angle_rad), r.score, r.in_capture_win ? 1 : 0, r.very_close ? 1 : 0);
         putText(bgr, txt, {10, 30}, FONT_HERSHEY_SIMPLEX, 0.55, {50, 220, 50}, 2, LINE_AA);
 
         imshow("color", bgr);
