@@ -281,14 +281,23 @@ int main()
     const int ROI_TOP = HEIGHT * 2 / 3;
     const int IMAGE_CENTER_X = WIDTH / 2;
 
-    // State machine
+    // ==================== State Machine Parameters ====================
     enum State
     {
         FOLLOW_LINE,
+        BALL_SEEN,
         APPROACH_BALL,
-        INTAKE_BALL,
-        RETURN_TO_LINE
+        CAPTURE_BALL, // Thêm state mới cho giai đoạn cuốn bóng
+        INTAKE_STATE,
+        RELOCK_LINE
     };
+
+    // Thêm các parameters mới
+    static const float APPROACH_SPEED = 0.4f;   // Tốc độ tiếp cận nhanh hơn
+    static const float CAPTURE_SPEED = 0.3f;    // Tốc độ cuốn bóng
+    static const float CAPTURE_DURATION = 1.5f; // Thời gian cuốn bóng (giây)
+    static const float ROTATE_SPEED = 0.25f;    // Tốc độ quay khi mất bóng
+    static const int CAPTURE_FRAMES = 30;
     State current_state = FOLLOW_LINE;
 
     int ball_detection_count = 0;
@@ -360,102 +369,155 @@ int main()
         float left_speed = 0.0f, right_speed = 0.0f;
         int intake_power = 0;
 
-        switch (current_state)
+        float vL = 0.0f, vR = 0.0f;
+        int intake_pwm = 0;
+        static int capture_counter = 0;
+
+        switch (st)
         {
         case FOLLOW_LINE:
-            if (line_center_x >= 0)
+        {
+            if (cx_line >= 0)
             {
-                tie(left_speed, right_speed) = follower.update(line_center_x, IMAGE_CENTER_X);
+                line_ok_hold = std::min(LINE_OK_HOLD, line_ok_hold + 1);
+                auto lr = follower.update(cx_line, centerX);
+                vL = lr.first;
+                vR = lr.second;
+                intake_pwm = 0; // Tắt intake khi follow line
             }
             else
             {
-                // Search for line
-                left_speed = -0.15f;
-                right_speed = 0.15f;
+                line_ok_hold = 0;
+                vL = -0.18f;
+                vR = 0.18f;
             }
 
-            if (ball.found && ball.score > BALL_DETECTION_THRESHOLD)
+            if (r.found && r.score > Smin && r.distance_m > 0.0f && r.distance_m < D_detect_max)
             {
-                ball_detection_count++;
-                if (ball_detection_count >= BALL_CONFIRMATION_COUNT)
+                if (++seen_hold >= N_detect_hold)
                 {
-                    current_state = APPROACH_BALL;
-                    ball_detection_count = 0;
-                    cout << "Ball detected! Switching to APPROACH_BALL" << endl;
+                    st = BALL_SEEN;
+                    seen_hold = 0;
                 }
             }
             else
             {
-                ball_detection_count = 0;
+                seen_hold = 0;
             }
             break;
+        }
+
+        case BALL_SEEN:
+        {
+            // Chuyển ngay sang approach
+            st = APPROACH_BALL;
+            std::cout << "Ball detected! Switching to APPROACH_BALL" << std::endl;
+            break;
+        }
 
         case APPROACH_BALL:
-            if (ball.found)
+        {
+            if (r.found)
             {
-                // Approach ball with steering
-                float steering = clamp(ball.angle * 2.0f, -0.8f, 0.8f);
-                float forward_speed = clamp((ball.distance - 0.2f) / 1.0f, 0.2f, 0.6f);
+                // Tiếp cận nhanh hơn với tốc độ cao hơn
+                float omega = std::clamp(r.angle_rad / (25.0f * (float)M_PI / 180.0f), -1.0f, 1.0f);
+                float fwd = std::clamp((r.distance_m - 0.2f) * 2.0f, 0.3f, APPROACH_SPEED);
 
-                left_speed = forward_speed - steering * 0.6f;
-                right_speed = forward_speed + steering * 0.6f;
+                vL = std::clamp(fwd - 0.7f * omega, -0.8f, 0.8f);
+                vR = std::clamp(fwd + 0.7f * omega, -0.8f, 0.8f);
 
-                if (ball.distance <= CAPTURE_DISTANCE)
+                // Bật intake sớm hơn khi gần bóng
+                if (r.distance_m < 0.5f)
                 {
-                    current_state = INTAKE_BALL;
-                    cout << "Ball captured! Switching to INTAKE_BALL" << endl;
+                    intake_pwm = INTAKE_PWM;
+                }
+
+                // Khi rất gần bóng, chuyển sang trạng thái cuốn
+                if (r.distance_m < D_captured || r.very_close)
+                {
+                    st = CAPTURE_BALL;
+                    capture_counter = 0;
+                    std::cout << "Very close to ball! Switching to CAPTURE_BALL" << std::endl;
                 }
             }
             else
             {
-                // Lost ball, search
-                left_speed = -0.1f;
-                right_speed = 0.1f;
-                ball_detection_count++;
+                // Quay tìm bóng với tốc độ cao hơn
+                vL = -ROTATE_SPEED;
+                vR = ROTATE_SPEED;
+                intake_pwm = 0;
 
-                if (ball_detection_count > 30)
+                // Nếu mất bóng quá lâu, quay lại tìm line
+                if (++seen_hold > 45)
                 {
-                    current_state = RETURN_TO_LINE;
-                    cout << "Ball lost. Returning to line." << endl;
+                    st = RELOCK_LINE;
+                    seen_hold = 0;
                 }
             }
             break;
+        }
 
-        case INTAKE_BALL:
-            // Run intake and move forward slightly
-            intake_power = 200;
-            left_speed = 0.2f;
-            right_speed = 0.2f;
+        case CAPTURE_BALL:
+        {
+            // Di chuyển thẳng với tốc độ ổn định để cuốn bóng
+            vL = CAPTURE_SPEED;
+            vR = CAPTURE_SPEED;
+            intake_pwm = INTAKE_PWM; // Bật intake mạnh
 
-            // After 1 second, return to line following
-            this_thread::sleep_for(chrono::seconds(1));
-            current_state = RETURN_TO_LINE;
-            cout << "Intake complete. Returning to line." << endl;
-            break;
+            capture_counter++;
 
-        case RETURN_TO_LINE:
-            intake_power = 0;
-
-            if (line_center_x >= 0)
+            // Tiếp tục cuốn trong CAPTURE_FRAMES frames
+            if (capture_counter >= CAPTURE_FRAMES)
             {
-                tie(left_speed, right_speed) = follower.update(line_center_x, IMAGE_CENTER_X);
+                st = INTAKE_STATE;
+                std::cout << "Capture complete! Switching to INTAKE_STATE" << std::endl;
+            }
+            break;
+        }
 
-                // Stay in line following for a while before looking for balls again
-                ball_detection_count++;
-                if (ball_detection_count > 50)
+        case INTAKE_STATE:
+        {
+            // Tiếp tục cuốn thêm một chút
+            vL = 0.2f;
+            vR = 0.2f;
+            intake_pwm = INTAKE_PWM;
+
+            static auto capture_start = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - capture_start);
+
+            if (elapsed.count() > CAPTURE_DURATION * 1000)
+            {
+                st = RELOCK_LINE;
+                std::cout << "Intake complete! Returning to line." << std::endl;
+            }
+            break;
+        }
+
+        case RELOCK_LINE:
+        {
+            if (cx_line >= 0)
+            {
+                auto lr = follower.update(cx_line, centerX);
+                vL = lr.first;
+                vR = lr.second;
+
+                if (++line_ok_hold >= LINE_OK_HOLD)
                 {
-                    current_state = FOLLOW_LINE;
-                    ball_detection_count = 0;
-                    cout << "Line reacquired. Switching to FOLLOW_LINE" << endl;
+                    st = FOLLOW_LINE;
+                    line_ok_hold = 0;
+                    std::cout << "Line reacquired! Switching to FOLLOW_LINE" << std::endl;
                 }
             }
             else
             {
-                // Search for line
-                left_speed = -0.15f;
-                right_speed = 0.15f;
+                vL = -0.2f;
+                vR = 0.2f;
+                line_ok_hold = 0;
             }
+            intake_pwm = 0; // Tắt intake khi tìm line
             break;
+        }
         }
 
         // Send commands to motors
