@@ -137,7 +137,6 @@ try
                 vL = motor_speeds.first;
                 vR = motor_speeds.second;
 
-                float err = float(cx - centerX);
                 std::cout << "OK; ERR=" << int(err)
                           << " | MOTOR " << vL << " " << vR << "\n";
             }
