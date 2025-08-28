@@ -232,158 +232,110 @@ BallResult detect_ball(const Mat &frame, const Mat &depth_frame,
     return result;
 }
 
-// ==================== Main Application ====================
+// ... (giữ nguyên phần include, UART, LineFollower, BallResult, detect_ball như bạn có)
+
 int main()
 {
-    // UART setup
     int uart_fd = open_uart("/dev/ttyACM0", 115200);
-
     if (uart_fd < 0)
     {
         std::cerr << "Warning: UART not available. Running in simulation mode." << std::endl;
     }
     else
     {
-        std::cout << "UART connected successfully. Waiting for Arduino ready message..." << std::endl;
-
-        // Đợi Arduino khởi động
+        std::cout << "UART connected successfully." << std::endl;
         sleep(2);
-
-        // Đọc message từ Arduino
-        char buffer[256];
-        ssize_t bytes_read = read(uart_fd, buffer, sizeof(buffer) - 1);
-        if (bytes_read > 0)
-        {
-            buffer[bytes_read] = '\0';
-            std::cout << "Arduino: " << buffer;
-        }
     }
 
-    // RealSense setup
+    // RealSense
     rs2::pipeline pipe;
     rs2::config cfg;
     const int WIDTH = 640, HEIGHT = 480, FPS = 30;
-
     cfg.enable_stream(RS2_STREAM_COLOR, WIDTH, HEIGHT, RS2_FORMAT_BGR8, FPS);
     cfg.enable_stream(RS2_STREAM_DEPTH, WIDTH, HEIGHT, RS2_FORMAT_Z16, FPS);
-
     auto profile = pipe.start(cfg);
     auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
     float depth_scale = depth_sensor.get_depth_scale();
-
     auto color_profile = profile.get_stream(RS2_STREAM_COLOR).as<rs2::video_stream_profile>();
     rs2_intrinsics intrinsics = color_profile.get_intrinsics();
-    float fx = intrinsics.fx;
-    float ppx = intrinsics.ppx;
+    float fx = intrinsics.fx, ppx = intrinsics.ppx;
 
-    // Initialize components
     LineFollower follower(0.015f, 0.0f, 0.004f, 0.25f, 0.02f);
     const int ROI_TOP = HEIGHT * 2 / 3;
     const int IMAGE_CENTER_X = WIDTH / 2;
 
-    // ==================== State Machine Parameters ====================
+    // --- State machine
     enum State
     {
         FOLLOW_LINE,
         BALL_SEEN,
         APPROACH_BALL,
-        CAPTURE_BALL, // Thêm state mới cho giai đoạn cuốn bóng
+        CAPTURE_BALL,
         INTAKE_STATE,
         RELOCK_LINE
     };
-
-    // Thêm các parameters mới
-    static const float APPROACH_SPEED = 0.4f;   // Tốc độ tiếp cận nhanh hơn
-    static const float CAPTURE_SPEED = 0.3f;    // Tốc độ cuốn bóng
-    static const float CAPTURE_DURATION = 1.5f; // Thời gian cuốn bóng (giây)
-    static const float ROTATE_SPEED = 0.25f;    // Tốc độ quay khi mất bóng
-    static const int CAPTURE_FRAMES = 30;
     State current_state = FOLLOW_LINE;
 
-    int ball_detection_count = 0;
-    const int BALL_CONFIRMATION_COUNT = 5;
-    const float BALL_DETECTION_THRESHOLD = 0.6f;
-    const float CAPTURE_DISTANCE = 0.3f;
+    int seen_hold = 0, line_ok_hold = 0, capture_counter = 0;
+    const int LINE_OK_HOLD = 4;
+    const int N_detect_hold = 3;
+    const float Smin = 0.6f, D_detect_max = 2.5f, D_captured = 0.3f;
+    const int INTAKE_PWM = 220;
 
-    cout << "Starting robot application..." << endl;
+    std::cout << "Starting robot application..." << std::endl;
 
     while (true)
     {
         rs2::frameset frames = pipe.wait_for_frames();
         rs2::frame color_frame = frames.get_color_frame();
         rs2::frame depth_frame = frames.get_depth_frame();
-
         Mat color_image(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color_frame.get_data());
         Mat depth_image(Size(WIDTH, HEIGHT), CV_16UC1, (void *)depth_frame.get_data());
 
-        // Line detection (blue line)
+        // --- Line detection
         Mat line_mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
-        const int BLUE_THRESHOLD = 30;
-        const int VALUE_THRESHOLD = 60;
-
+        const int BLUE_T = 30, Vmin = 60;
         for (int y = ROI_TOP; y < HEIGHT; y++)
         {
             Vec3b *row = color_image.ptr<Vec3b>(y);
             uchar *mask_row = line_mask.ptr<uchar>(y);
-
             for (int x = 0; x < WIDTH; x++)
             {
-                int blue = row[x][0], green = row[x][1], red = row[x][2];
-                int max_value = max({blue, green, red});
-
-                if (blue > green + BLUE_THRESHOLD && blue > red + BLUE_THRESHOLD &&
-                    max_value >= VALUE_THRESHOLD)
-                {
+                int B = row[x][0], G = row[x][1], R = row[x][2], V = max({B, G, R});
+                if (B > G + BLUE_T && B > R + BLUE_T && V >= Vmin)
                     mask_row[x] = 255;
-                }
             }
         }
-
-        // Process line mask
-        Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
-        morphologyEx(line_mask, line_mask, MORPH_CLOSE, kernel, Point(-1, -1), 2);
-
+        morphologyEx(line_mask, line_mask, MORPH_CLOSE,
+                     getStructuringElement(MORPH_RECT, {5, 5}), Point(-1, -1), 2);
         vector<vector<Point>> contours;
         findContours(line_mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-
         int line_center_x = -1;
         if (!contours.empty())
         {
-            auto largest_contour = *max_element(contours.begin(), contours.end(),
-                                                [](const vector<Point> &a, const vector<Point> &b)
-                                                {
-                                                    return contourArea(a) < contourArea(b);
-                                                });
-
-            Moments m = moments(largest_contour);
+            auto largest = *max_element(contours.begin(), contours.end(),
+                                        [](auto &a, auto &b)
+                                        { return contourArea(a) < contourArea(b); });
+            Moments m = moments(largest);
             if (m.m00 > 0)
-            {
-                line_center_x = static_cast<int>(m.m10 / m.m00);
-            }
+                line_center_x = int(m.m10 / m.m00);
         }
 
-        // Ball detection
+        // --- Ball detection
         BallResult ball = detect_ball(color_image, depth_image, fx, ppx, depth_scale);
 
-        // State machine logic
-        float left_speed = 0.0f, right_speed = 0.0f;
-        int intake_power = 0;
-
-        float vL = 0.0f, vR = 0.0f;
+        // --- State logic
+        float vL = 0, vR = 0;
         int intake_pwm = 0;
-        static int capture_counter = 0;
-
-        switch (st)
+        switch (current_state)
         {
         case FOLLOW_LINE:
-        {
-            if (cx_line >= 0)
+            if (line_center_x >= 0)
             {
-                line_ok_hold = std::min(LINE_OK_HOLD, line_ok_hold + 1);
-                auto lr = follower.update(cx_line, centerX);
-                vL = lr.first;
-                vR = lr.second;
-                intake_pwm = 0; // Tắt intake khi follow line
+                line_ok_hold = min(LINE_OK_HOLD, line_ok_hold + 1);
+                auto [l, r] = follower.update(line_center_x, IMAGE_CENTER_X);
+                vL = l;
+                vR = r;
             }
             else
             {
@@ -391,183 +343,116 @@ int main()
                 vL = -0.18f;
                 vR = 0.18f;
             }
-
-            if (r.found && r.score > Smin && r.distance_m > 0.0f && r.distance_m < D_detect_max)
+            if (ball.found && ball.score > Smin && ball.distance > 0 && ball.distance < D_detect_max)
             {
                 if (++seen_hold >= N_detect_hold)
                 {
-                    st = BALL_SEEN;
+                    current_state = BALL_SEEN;
                     seen_hold = 0;
                 }
             }
             else
-            {
                 seen_hold = 0;
-            }
             break;
-        }
 
         case BALL_SEEN:
-        {
-            // Chuyển ngay sang approach
-            st = APPROACH_BALL;
-            std::cout << "Ball detected! Switching to APPROACH_BALL" << std::endl;
+            current_state = APPROACH_BALL;
+            std::cout << "Ball detected -> APPROACH" << std::endl;
             break;
-        }
 
         case APPROACH_BALL:
-        {
-            if (r.found)
+            if (ball.found)
             {
-                // Tiếp cận nhanh hơn với tốc độ cao hơn
-                float omega = std::clamp(r.angle_rad / (25.0f * (float)M_PI / 180.0f), -1.0f, 1.0f);
-                float fwd = std::clamp((r.distance_m - 0.2f) * 2.0f, 0.3f, APPROACH_SPEED);
-
-                vL = std::clamp(fwd - 0.7f * omega, -0.8f, 0.8f);
-                vR = std::clamp(fwd + 0.7f * omega, -0.8f, 0.8f);
-
-                // Bật intake sớm hơn khi gần bóng
-                if (r.distance_m < 0.5f)
-                {
+                float omega = clamp((ball.angle) / (25.0f * M_PI / 180.0f), -1.0f, 1.0f);
+                float fwd = clamp((ball.distance - 0.2f) * 2.0f, 0.3f, 0.5f);
+                vL = clamp(fwd - 0.7f * omega, -0.8f, 0.8f);
+                vR = clamp(fwd + 0.7f * omega, -0.8f, 0.8f);
+                if (ball.distance < 0.5f)
                     intake_pwm = INTAKE_PWM;
-                }
-
-                // Khi rất gần bóng, chuyển sang trạng thái cuốn
-                if (r.distance_m < D_captured || r.very_close)
+                if (ball.distance < D_captured)
                 {
-                    st = CAPTURE_BALL;
+                    current_state = CAPTURE_BALL;
                     capture_counter = 0;
-                    std::cout << "Very close to ball! Switching to CAPTURE_BALL" << std::endl;
-                }
-            }
-            else
-            {
-                // Quay tìm bóng với tốc độ cao hơn
-                vL = -ROTATE_SPEED;
-                vR = ROTATE_SPEED;
-                intake_pwm = 0;
-
-                // Nếu mất bóng quá lâu, quay lại tìm line
-                if (++seen_hold > 45)
-                {
-                    st = RELOCK_LINE;
-                    seen_hold = 0;
-                }
-            }
-            break;
-        }
-
-        case CAPTURE_BALL:
-        {
-            // Di chuyển thẳng với tốc độ ổn định để cuốn bóng
-            vL = CAPTURE_SPEED;
-            vR = CAPTURE_SPEED;
-            intake_pwm = INTAKE_PWM; // Bật intake mạnh
-
-            capture_counter++;
-
-            // Tiếp tục cuốn trong CAPTURE_FRAMES frames
-            if (capture_counter >= CAPTURE_FRAMES)
-            {
-                st = INTAKE_STATE;
-                std::cout << "Capture complete! Switching to INTAKE_STATE" << std::endl;
-            }
-            break;
-        }
-
-        case INTAKE_STATE:
-        {
-            // Tiếp tục cuốn thêm một chút
-            vL = 0.2f;
-            vR = 0.2f;
-            intake_pwm = INTAKE_PWM;
-
-            static auto capture_start = std::chrono::steady_clock::now();
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - capture_start);
-
-            if (elapsed.count() > CAPTURE_DURATION * 1000)
-            {
-                st = RELOCK_LINE;
-                std::cout << "Intake complete! Returning to line." << std::endl;
-            }
-            break;
-        }
-
-        case RELOCK_LINE:
-        {
-            if (cx_line >= 0)
-            {
-                auto lr = follower.update(cx_line, centerX);
-                vL = lr.first;
-                vR = lr.second;
-
-                if (++line_ok_hold >= LINE_OK_HOLD)
-                {
-                    st = FOLLOW_LINE;
-                    line_ok_hold = 0;
-                    std::cout << "Line reacquired! Switching to FOLLOW_LINE" << std::endl;
                 }
             }
             else
             {
                 vL = -0.2f;
                 vR = 0.2f;
-                line_ok_hold = 0;
             }
-            intake_pwm = 0; // Tắt intake khi tìm line
+            break;
+
+        case CAPTURE_BALL:
+            vL = vR = 0.3f;
+            intake_pwm = INTAKE_PWM;
+            if (++capture_counter >= 30)
+                current_state = INTAKE_STATE;
+            break;
+
+        case INTAKE_STATE:
+        {
+            static auto t0 = chrono::steady_clock::now();
+            static bool started = false;
+            if (!started)
+            {
+                t0 = chrono::steady_clock::now();
+                started = true;
+            }
+            vL = vR = 0.2f;
+            intake_pwm = INTAKE_PWM;
+            if (chrono::steady_clock::now() - t0 > chrono::seconds(2))
+            {
+                started = false;
+                current_state = RELOCK_LINE;
+            }
             break;
         }
+
+        case RELOCK_LINE:
+            if (line_center_x >= 0)
+            {
+                auto [l, r] = follower.update(line_center_x, IMAGE_CENTER_X);
+                vL = l;
+                vR = r;
+                if (++line_ok_hold >= LINE_OK_HOLD)
+                {
+                    current_state = FOLLOW_LINE;
+                    line_ok_hold = 0;
+                }
+            }
+            else
+            {
+                vL = -0.2f;
+                vR = 0.2f;
+            }
+            intake_pwm = 0;
+            break;
         }
 
-        // Send commands to motors
-        drive_motors(uart_fd, left_speed, right_speed);
-        set_intake(uart_fd, intake_power);
+        // --- Send motor
+        drive_motors(uart_fd, vL, vR);
+        set_intake(uart_fd, intake_pwm);
 
-        // Display for debugging
-        Mat display = color_image.clone();
-        line(display, Point(IMAGE_CENTER_X, 0), Point(IMAGE_CENTER_X, HEIGHT), Scalar(255, 255, 0), 2);
-        line(display, Point(0, ROI_TOP), Point(WIDTH, ROI_TOP), Scalar(200, 200, 200), 2);
-
+        // --- Overlay
+        Mat disp = color_image.clone();
+        line(disp, {IMAGE_CENTER_X, 0}, {IMAGE_CENTER_X, HEIGHT}, {255, 255, 0}, 2);
+        line(disp, {0, ROI_TOP}, {WIDTH, ROI_TOP}, {200, 200, 200}, 2);
         if (line_center_x >= 0)
-        {
-            line(display, Point(line_center_x, ROI_TOP), Point(line_center_x, HEIGHT), Scalar(0, 255, 255), 3);
-        }
-
+            line(disp, {line_center_x, ROI_TOP}, {line_center_x, HEIGHT}, {0, 255, 255}, 3);
         if (ball.found)
-        {
-            circle(display, Point(ball.center_x, ball.center_y), ball.radius, Scalar(0, 255, 0), 3);
-            putText(display, format("Dist: %.2fm", ball.distance),
-                    Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
-        }
+            circle(disp, {ball.center_x, ball.center_y}, ball.radius, {0, 255, 0}, 2);
 
-        string state_names[] = {"FOLLOW_LINE", "APPROACH_BALL", "INTAKE_BALL", "RETURN_TO_LINE"};
-        putText(display, "State: " + state_names[current_state],
-                Point(10, 60), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(50, 220, 50), 2);
-
-        putText(display, format("Motors: L=%.2f R=%.2f", left_speed, right_speed),
-                Point(10, 90), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(50, 220, 50), 2);
-
-        putText(display, format("Intake: %d", intake_power),
-                Point(10, 120), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(50, 220, 50), 2);
-
-        imshow("Robot View", display);
-
+        string names[] = {"FOLLOW_LINE", "BALL_SEEN", "APPROACH_BALL", "CAPTURE_BALL", "INTAKE", "RELOCK"};
+        putText(disp, "State:" + names[current_state], {10, 30}, FONT_HERSHEY_SIMPLEX, 0.7, {50, 220, 50}, 2);
+        imshow("Robot", disp);
         if (waitKey(1) == 27)
-        {
             break;
-        }
     }
 
-    // Cleanup
-    drive_motors(uart_fd, 0.0f, 0.0f);
+    drive_motors(uart_fd, 0, 0);
     set_intake(uart_fd, 0);
-
     if (uart_fd >= 0)
-    {
         close(uart_fd);
-    }
-
     pipe.stop();
     return 0;
 }
