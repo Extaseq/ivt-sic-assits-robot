@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <vector>
 #include <algorithm>
+#include <cmath>
 
 using namespace cv;
 using namespace std;
@@ -263,11 +264,25 @@ int main()
     LineFollower follower(0.015f, 0.0f, 0.004f, 0.25f, 0.02f);
     const int ROI_TOP = HEIGHT * 2 / 3;
     const int IMAGE_CENTER_X = WIDTH / 2;
+    const int ROI_NEAR_H = 60;
+    const int ROI_FAR_H = 60;
+    const int ROI_NEAR_Y = HEIGHT - ROI_NEAR_H;
+    const int ROI_FAR_Y = HEIGHT - ROI_NEAR_H - ROI_FAR_H;
+
+    const int T_NEAR = 9000;
+    const int T_FAR = 2000;
+    const int MARGIN = 30;
+    const int BAND_CX = 40;
+    const int CORNER_HOLD = 3;
+    const float TURN_SPEED = 0.3f;
+    const float TURN_TIMEOUT = 0.8f;
 
     // --- State machine
     enum State
     {
         FOLLOW_LINE,
+        TURN_LEFT_90,
+        TURN_RIGHT_90,
         BALL_SEEN,
         APPROACH_BALL,
         CAPTURE_BALL,
@@ -277,10 +292,12 @@ int main()
     State current_state = FOLLOW_LINE;
 
     int seen_hold = 0, line_ok_hold = 0, capture_counter = 0;
+    int corner_left_hold = 0, corner_right_hold = 0;
     const int LINE_OK_HOLD = 4;
     const int N_detect_hold = 3;
     const float Smin = 0.6f, D_detect_max = 2.5f, D_captured = 0.3f;
     const int INTAKE_PWM = 220;
+    chrono::steady_clock::time_point turn_start;
 
     std::cout << "Starting robot application..." << std::endl;
 
@@ -321,6 +338,71 @@ int main()
                 line_center_x = int(m.m10 / m.m00);
         }
 
+        // --- ROI analysis for corner detection
+        Rect roi_near(0, ROI_NEAR_Y, WIDTH, ROI_NEAR_H);
+        Rect roi_far(0, ROI_FAR_Y, WIDTH, ROI_FAR_H);
+        Mat mask_near = line_mask(roi_near);
+        Mat mask_far = line_mask(roi_far);
+        int near_pixels = countNonZero(mask_near);
+        int far_pixels = countNonZero(mask_far);
+
+        vector<vector<Point>> c_near;
+        findContours(mask_near, c_near, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+        Rect near_bbox;
+        float near_theta = 0.0f;
+        if (!c_near.empty())
+        {
+            auto ln = *max_element(c_near.begin(), c_near.end(),
+                                   [](auto &a, auto &b)
+                                   { return contourArea(a) < contourArea(b); });
+            near_bbox = boundingRect(ln);
+            if (ln.size() >= 2)
+            {
+                Vec4f line;
+                fitLine(ln, line, DIST_L2, 0, 0.01, 0.01);
+                near_theta = atan2(line[1], line[0]) * 180.0f / CV_PI;
+            }
+        }
+
+        vector<vector<Point>> c_far;
+        findContours(mask_far, c_far, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+        float far_theta = 0.0f;
+        int far_cx = -1;
+        if (!c_far.empty())
+        {
+            auto lf = *max_element(c_far.begin(), c_far.end(),
+                                   [](auto &a, auto &b)
+                                   { return contourArea(a) < contourArea(b); });
+            Moments m = moments(lf);
+            if (m.m00 > 0)
+                far_cx = int(m.m10 / m.m00);
+            if (lf.size() >= 2)
+            {
+                Vec4f line;
+                fitLine(lf, line, DIST_L2, 0, 0.01, 0.01);
+                far_theta = atan2(line[1], line[0]) * 180.0f / CV_PI;
+            }
+        }
+
+        bool near_big = near_pixels > T_NEAR;
+        bool far_small = far_pixels < T_FAR;
+        bool near_left = near_bbox.x <= MARGIN;
+        bool near_right = near_bbox.x + near_bbox.width >= WIDTH - MARGIN;
+        bool near_flat = fabs(near_theta) < 30.0f;
+
+        if (current_state == FOLLOW_LINE)
+        {
+            if (near_big && far_small && near_flat && near_left)
+                corner_left_hold = min(CORNER_HOLD, corner_left_hold + 1);
+            else
+                corner_left_hold = 0;
+
+            if (near_big && far_small && near_flat && near_right)
+                corner_right_hold = min(CORNER_HOLD, corner_right_hold + 1);
+            else
+                corner_right_hold = 0;
+        }
+
         // --- Ball detection
         BallResult ball = detect_ball(color_image, depth_image, fx, ppx, depth_scale);
 
@@ -353,6 +435,47 @@ int main()
             }
             else
                 seen_hold = 0;
+
+            if (corner_left_hold >= CORNER_HOLD)
+            {
+                current_state = TURN_LEFT_90;
+                follower.reset();
+                turn_start = chrono::steady_clock::now();
+                corner_left_hold = corner_right_hold = 0;
+            }
+            else if (corner_right_hold >= CORNER_HOLD)
+            {
+                current_state = TURN_RIGHT_90;
+                follower.reset();
+                turn_start = chrono::steady_clock::now();
+                corner_left_hold = corner_right_hold = 0;
+            }
+            break;
+
+        case TURN_LEFT_90:
+            vL = -TURN_SPEED;
+            vR = TURN_SPEED;
+            if ((far_pixels > T_NEAR && fabs(fabs(far_theta) - 90.0f) < 20.0f &&
+                 far_cx >= 0 && abs(far_cx - IMAGE_CENTER_X) < BAND_CX) ||
+                chrono::steady_clock::now() - turn_start > chrono::duration<float>(TURN_TIMEOUT))
+            {
+                current_state = RELOCK_LINE;
+                follower.reset();
+                line_ok_hold = 0;
+            }
+            break;
+
+        case TURN_RIGHT_90:
+            vL = TURN_SPEED;
+            vR = -TURN_SPEED;
+            if ((far_pixels > T_NEAR && fabs(fabs(far_theta) - 90.0f) < 20.0f &&
+                 far_cx >= 0 && abs(far_cx - IMAGE_CENTER_X) < BAND_CX) ||
+                chrono::steady_clock::now() - turn_start > chrono::duration<float>(TURN_TIMEOUT))
+            {
+                current_state = RELOCK_LINE;
+                follower.reset();
+                line_ok_hold = 0;
+            }
             break;
 
         case BALL_SEEN:
@@ -363,7 +486,8 @@ int main()
         case APPROACH_BALL:
             if (ball.found)
             {
-                float omega = clamp((ball.angle) / (25.0f * M_PI / 180.0f), -1.0f, 1.0f);
+                float omega = std::clamp(
+                    static_cast<float>(ball.angle / (25.0f * M_PI / 180.0f)), -1.0f, 1.0f);
                 float fwd = clamp((ball.distance - 0.2f) * 2.0f, 0.3f, 0.5f);
                 vL = clamp(fwd - 0.7f * omega, -0.8f, 0.8f);
                 vR = clamp(fwd + 0.7f * omega, -0.8f, 0.8f);
@@ -437,12 +561,14 @@ int main()
         Mat disp = color_image.clone();
         line(disp, {IMAGE_CENTER_X, 0}, {IMAGE_CENTER_X, HEIGHT}, {255, 255, 0}, 2);
         line(disp, {0, ROI_TOP}, {WIDTH, ROI_TOP}, {200, 200, 200}, 2);
+        rectangle(disp, roi_near, {100, 100, 255}, 2);
+        rectangle(disp, roi_far, {100, 255, 100}, 2);
         if (line_center_x >= 0)
             line(disp, {line_center_x, ROI_TOP}, {line_center_x, HEIGHT}, {0, 255, 255}, 3);
         if (ball.found)
             circle(disp, {ball.center_x, ball.center_y}, ball.radius, {0, 255, 0}, 2);
 
-        string names[] = {"FOLLOW_LINE", "BALL_SEEN", "APPROACH_BALL", "CAPTURE_BALL", "INTAKE", "RELOCK"};
+        string names[] = {"FOLLOW_LINE", "TURN_L90", "TURN_R90", "BALL_SEEN", "APPROACH_BALL", "CAPTURE_BALL", "INTAKE", "RELOCK"};
         putText(disp, "State:" + names[current_state], {10, 30}, FONT_HERSHEY_SIMPLEX, 0.7, {50, 220, 50}, 2);
         imshow("Robot", disp);
         if (waitKey(1) == 27)
