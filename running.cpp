@@ -309,22 +309,54 @@ int main()
         Mat color_image(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color_frame.get_data());
         Mat depth_image(Size(WIDTH, HEIGHT), CV_16UC1, (void *)depth_frame.get_data());
 
-        // --- Line detection
-        Mat line_mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
-        const int BLUE_T = 30, Vmin = 60;
-        for (int y = ROI_TOP; y < HEIGHT; y++)
-        {
-            Vec3b *row = color_image.ptr<Vec3b>(y);
-            uchar *mask_row = line_mask.ptr<uchar>(y);
-            for (int x = 0; x < WIDTH; x++)
-            {
-                int B = row[x][0], G = row[x][1], R = row[x][2], V = max({B, G, R});
-                if (B > G + BLUE_T && B > R + BLUE_T && V >= Vmin)
-                    mask_row[x] = 255;
+        // --- Line detection using Edge Detection
+        Mat gray_image;
+        cvtColor(color_image, gray_image, COLOR_BGR2GRAY);
+
+        // Apply Bilateral filter to reduce noise while preserving edges
+        Mat filtered;
+        bilateralFilter(gray_image, filtered, 9, 75, 75);
+
+        // Compute gradient magnitude for auto-Canny threshold
+        Mat grad_x, grad_y, grad_mag;
+        Sobel(filtered, grad_x, CV_16S, 1, 0, 3);
+        Sobel(filtered, grad_y, CV_16S, 0, 1, 3);
+        convertScaleAbs(grad_x, grad_x);
+        convertScaleAbs(grad_y, grad_y);
+        addWeighted(grad_x, 0.5, grad_y, 0.5, 0, grad_mag);
+
+        // Calculate median of gradient magnitude for auto-threshold
+        vector<uchar> grad_values;
+        grad_values.reserve(grad_mag.rows * grad_mag.cols);
+        for (int i = 0; i < grad_mag.rows; ++i) {
+            for (int j = 0; j < grad_mag.cols; ++j) {
+                grad_values.push_back(grad_mag.at<uchar>(i, j));
             }
         }
-        morphologyEx(line_mask, line_mask, MORPH_CLOSE,
-                     getStructuringElement(MORPH_RECT, {5, 5}), Point(-1, -1), 2);
+        sort(grad_values.begin(), grad_values.end());
+        double median = grad_values[grad_values.size() / 2];
+
+        // Auto-Canny thresholds based on median
+        double sigma = 0.33;
+        double lower_threshold = max(0.0, (1.0 - sigma) * median);
+        double upper_threshold = min(255.0, (1.0 + sigma) * median);
+
+        // Apply Canny edge detection with auto-thresholds
+        Mat edges;
+        Canny(filtered, edges, lower_threshold, upper_threshold);
+
+        // Create ROI mask for bottom part of image
+        Mat roi_mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
+        roi_mask(Range(ROI_TOP, HEIGHT), Range::all()) = 255;
+
+        // Apply ROI mask to edges
+        Mat line_mask;
+        bitwise_and(edges, roi_mask, line_mask);
+
+        // Morphological operations to clean up edges
+        Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
+        morphologyEx(line_mask, line_mask, MORPH_CLOSE, kernel);
+        morphologyEx(line_mask, line_mask, MORPH_OPEN, kernel);
         vector<vector<Point>> contours;
         findContours(line_mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
         int line_center_x = -1;
