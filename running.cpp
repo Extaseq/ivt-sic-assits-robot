@@ -112,17 +112,36 @@ void set_intake(int fd, int power)
 class LineFollower
 {
 public:
-    LineFollower(float kp = 0.015f, float ki = 0.0f, float kd = 0.004f,
-                 float base_speed = 0.25f, float dt = 0.02f)
-        : kp_(kp), ki_(ki), kd_(kd), base_speed_(base_speed), dt_(dt) {}
+    LineFollower(float kp = 0.010f, float ki = 0.0f, float kd = 0.002f,
+                 float base_speed = 0.25f, float dt = 0.02f, float max_steer_rate = 0.1f)
+        : kp_(kp), ki_(ki), kd_(kd), base_speed_(base_speed), dt_(dt), max_steer_rate_(max_steer_rate) {}
 
-    pair<float, float> update(int line_center_x, int image_center_x)
+    pair<float, float> update(float error_norm, bool line_detected)
     {
-        float error = static_cast<float>(line_center_x - image_center_x);
-        integral_ += error * dt_;
-        float derivative = (error - prev_error_) / dt_;
+        if (!line_detected)
+        {
+            prev_steering_ = 0.0f;
+            return {0.0f, 0.0f}; // No control when line not detected
+        }
 
-        float steering = kp_ * error + ki_ * integral_ + kd_ * derivative;
+        // Reset PID when line is newly detected
+        if (!prev_line_detected_)
+        {
+            integral_ = 0.0f;
+            prev_error_ = error_norm;
+            prev_line_detected_ = true;
+        }
+
+        integral_ += error_norm * dt_;
+        float derivative = (error_norm - prev_error_) / dt_;
+
+        float steering = kp_ * error_norm + ki_ * integral_ + kd_ * derivative;
+        steering = clamp(steering, -0.6f, 0.6f);
+
+        // Apply slew-rate limiting
+        float steer_delta = steering - prev_steering_;
+        steer_delta = clamp(steer_delta, -max_steer_rate_, max_steer_rate_);
+        steering = prev_steering_ + steer_delta;
         steering = clamp(steering, -0.6f, 0.6f);
 
         float left_speed = base_speed_ - steering;
@@ -131,7 +150,8 @@ public:
         left_speed = clamp(left_speed, -1.0f, 1.0f);
         right_speed = clamp(right_speed, -1.0f, 1.0f);
 
-        prev_error_ = error;
+        prev_error_ = error_norm;
+        prev_steering_ = steering;
         return {left_speed, right_speed};
     }
 
@@ -139,6 +159,8 @@ public:
     {
         integral_ = 0.0f;
         prev_error_ = 0.0f;
+        prev_steering_ = 0.0f;
+        prev_line_detected_ = false;
     }
 
 private:
@@ -150,8 +172,11 @@ private:
     float kp_, ki_, kd_;
     float base_speed_;
     float dt_;
+    float max_steer_rate_;
     float integral_ = 0.0f;
     float prev_error_ = 0.0f;
+    float prev_steering_ = 0.0f;
+    bool prev_line_detected_ = false;
 };
 
 // ==================== Ball Detection ====================
@@ -261,7 +286,7 @@ int main()
     rs2_intrinsics intrinsics = color_profile.get_intrinsics();
     float fx = intrinsics.fx, ppx = intrinsics.ppx;
 
-    LineFollower follower(0.015f, 0.0f, 0.004f, 0.25f, 0.02f);
+    LineFollower follower(0.010f, 0.0f, 0.002f, 0.25f, 0.02f, 0.1f);
     const int ROI_TOP = HEIGHT * 2 / 3;
     const int IMAGE_CENTER_X = WIDTH / 2;
     const int ROI_NEAR_H = 60;
@@ -317,29 +342,33 @@ int main()
         Mat filtered;
         bilateralFilter(gray_image, filtered, 9, 75, 75);
 
-        // Compute gradient magnitude for auto-Canny threshold
-        Mat grad_x, grad_y, grad_mag;
-        Sobel(filtered, grad_x, CV_16S, 1, 0, 3);
-        Sobel(filtered, grad_y, CV_16S, 0, 1, 3);
-        convertScaleAbs(grad_x, grad_x);
-        convertScaleAbs(grad_y, grad_y);
-        addWeighted(grad_x, 0.5, grad_y, 0.5, 0, grad_mag);
+        // Define ROI_near for gradient calculation
+        Rect roi_near_rect(0, ROI_NEAR_Y, WIDTH, ROI_NEAR_H);
+        Mat filtered_near = filtered(roi_near_rect);
 
-        // Calculate median of gradient magnitude for auto-threshold
-        vector<uchar> grad_values;
-        grad_values.reserve(grad_mag.rows * grad_mag.cols);
-        for (int i = 0; i < grad_mag.rows; ++i) {
-            for (int j = 0; j < grad_mag.cols; ++j) {
-                grad_values.push_back(grad_mag.at<uchar>(i, j));
+        // Compute gradient magnitude for auto-Canny threshold on ROI_near
+        Mat grad_x_near, grad_y_near, grad_mag_near;
+        Sobel(filtered_near, grad_x_near, CV_16S, 1, 0, 3);
+        Sobel(filtered_near, grad_y_near, CV_16S, 0, 1, 3);
+        convertScaleAbs(grad_x_near, grad_x_near);
+        convertScaleAbs(grad_y_near, grad_y_near);
+        addWeighted(grad_x_near, 0.5, grad_y_near, 0.5, 0, grad_mag_near);
+
+        // Calculate median of gradient magnitude for auto-threshold on ROI_near
+        vector<uchar> grad_values_near;
+        grad_values_near.reserve(grad_mag_near.rows * grad_mag_near.cols);
+        for (int i = 0; i < grad_mag_near.rows; ++i) {
+            for (int j = 0; j < grad_mag_near.cols; ++j) {
+                grad_values_near.push_back(grad_mag_near.at<uchar>(i, j));
             }
         }
-        sort(grad_values.begin(), grad_values.end());
-        double median = grad_values[grad_values.size() / 2];
+        sort(grad_values_near.begin(), grad_values_near.end());
+        double median_near = grad_values_near[grad_values_near.size() / 2];
 
         // Auto-Canny thresholds based on median
         double sigma = 0.33;
-        double lower_threshold = max(0.0, (1.0 - sigma) * median);
-        double upper_threshold = min(255.0, (1.0 + sigma) * median);
+        double lower_threshold = max(0.0, (1.0 - sigma) * median_near);
+        double upper_threshold = min(255.0, (1.0 + sigma) * median_near);
 
         // Apply Canny edge detection with auto-thresholds
         Mat edges;
@@ -357,18 +386,46 @@ int main()
         Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
         morphologyEx(line_mask, line_mask, MORPH_CLOSE, kernel);
         morphologyEx(line_mask, line_mask, MORPH_OPEN, kernel);
-        vector<vector<Point>> contours;
-        findContours(line_mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-        int line_center_x = -1;
-        if (!contours.empty())
+
+        // --- Calculate cx_near using fitLine on ROI_near
+        Mat mask_near_full = line_mask(roi_near_rect);
+        vector<vector<Point>> c_near_full;
+        findContours(mask_near_full, c_near_full, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+        int cx_near = -1;
+        bool line_confident = false;
+        if (!c_near_full.empty())
         {
-            auto largest = *max_element(contours.begin(), contours.end(),
-                                        [](auto &a, auto &b)
-                                        { return contourArea(a) < contourArea(b); });
-            Moments m = moments(largest);
-            if (m.m00 > 0)
-                line_center_x = int(m.m10 / m.m00);
+            auto largest_near = *max_element(c_near_full.begin(), c_near_full.end(),
+                                           [](auto &a, auto &b) { return contourArea(a) < contourArea(b); });
+
+            if (largest_near.size() >= 2)
+            {
+                Vec4f line_params;
+                fitLine(largest_near, line_params, DIST_L2, 0, 0.01, 0.01);
+
+                // Calculate intersection with bottom of ROI_near (y = ROI_NEAR_Y + ROI_NEAR_H)
+                float vx = line_params[0], vy = line_params[1];
+                float x0 = line_params[2], y0 = line_params[3];
+
+                if (abs(vx) > 1e-6) // Avoid division by zero
+                {
+                    float t = (ROI_NEAR_Y + ROI_NEAR_H - y0) / vy;
+                    cx_near = static_cast<int>(x0 + t * vx);
+                    cx_near = max(0, min(WIDTH - 1, cx_near)); // Clamp to image bounds
+                }
+                else
+                {
+                    cx_near = static_cast<int>(x0); // Vertical line
+                }
+
+                // Check confidence: enough pixels and nearly vertical
+                float theta_near = atan2(vy, vx) * 180.0f / CV_PI;
+                line_confident = (near_pixels > T_NEAR) && (fabs(theta_near) < 30.0f);
+            }
         }
+
+        // Use cx_near for PID control (no need for line_center_x anymore)
 
         // --- ROI analysis for corner detection
         Rect roi_near(0, ROI_NEAR_Y, WIDTH, ROI_NEAR_H);
@@ -444,18 +501,22 @@ int main()
         switch (current_state)
         {
         case FOLLOW_LINE:
-            if (line_center_x >= 0)
+            if (line_confident)
             {
                 line_ok_hold = min(LINE_OK_HOLD, line_ok_hold + 1);
-                auto [l, r] = follower.update(line_center_x, IMAGE_CENTER_X);
+                // Normalized error: (cx_near - IMAGE_CENTER_X) / (WIDTH/2) ∈ [-1,1]
+                float error_norm = static_cast<float>(cx_near - IMAGE_CENTER_X) / (WIDTH / 2.0f);
+                auto [l, r] = follower.update(error_norm, true);
                 vL = l;
                 vR = r;
             }
             else
             {
                 line_ok_hold = 0;
-                vL = -0.18f;
-                vR = 0.18f;
+                // No confident line detection - gentle search
+                auto [l, r] = follower.update(0.0f, false);
+                vL = -0.15f; // Gentle left turn to search
+                vR = 0.15f;
             }
             if (ball.found && ball.score > Smin && ball.distance > 0 && ball.distance < D_detect_max)
             {
@@ -565,9 +626,10 @@ int main()
         }
 
         case RELOCK_LINE:
-            if (line_center_x >= 0)
+            if (line_confident)
             {
-                auto [l, r] = follower.update(line_center_x, IMAGE_CENTER_X);
+                auto [l, r] = follower.update(
+                    static_cast<float>(cx_near - IMAGE_CENTER_X) / (WIDTH / 2.0f), true);
                 vL = l;
                 vR = r;
                 if (++line_ok_hold >= LINE_OK_HOLD)
@@ -578,8 +640,10 @@ int main()
             }
             else
             {
-                vL = -0.2f;
-                vR = 0.2f;
+                // Gentle search when no confident line
+                auto [l, r] = follower.update(0.0f, false);
+                vL = -0.15f;
+                vR = 0.15f;
             }
             intake_pwm = 0;
             break;
@@ -595,13 +659,14 @@ int main()
         line(disp, {0, ROI_TOP}, {WIDTH, ROI_TOP}, {200, 200, 200}, 2);
         rectangle(disp, roi_near, {100, 100, 255}, 2);
         rectangle(disp, roi_far, {100, 255, 100}, 2);
-        if (line_center_x >= 0)
-            line(disp, {line_center_x, ROI_TOP}, {line_center_x, HEIGHT}, {0, 255, 255}, 3);
+        if (cx_near >= 0)
+            line(disp, {cx_near, ROI_TOP}, {cx_near, HEIGHT}, {0, 255, 255}, 3);
         if (ball.found)
             circle(disp, {ball.center_x, ball.center_y}, ball.radius, {0, 255, 0}, 2);
 
         string names[] = {"FOLLOW_LINE", "TURN_L90", "TURN_R90", "BALL_SEEN", "APPROACH_BALL", "CAPTURE_BALL", "INTAKE", "RELOCK"};
         putText(disp, "State:" + names[current_state], {10, 30}, FONT_HERSHEY_SIMPLEX, 0.7, {50, 220, 50}, 2);
+        putText(disp, "Confident: " + string(line_confident ? "YES" : "NO"), {10, 60}, FONT_HERSHEY_SIMPLEX, 0.7, {50, 220, 50}, 2);
         imshow("Robot", disp);
         if (waitKey(1) == 27)
             break;
