@@ -486,7 +486,8 @@ int main()
         case APPROACH_BALL:
             if (ball.found)
             {
-                float omega = clamp((ball.angle) / (25.0f * M_PI / 180.0f), -1.0f, 1.0f);
+                float omega = std::clamp(
+                    static_cast<float>(ball.angle / (25.0f * M_PI / 180.0f)), -1.0f, 1.0f);
                 float fwd = clamp((ball.distance - 0.2f) * 2.0f, 0.3f, 0.5f);
                 vL = clamp(fwd - 0.7f * omega, -0.8f, 0.8f);
                 vR = clamp(fwd + 0.7f * omega, -0.8f, 0.8f);
