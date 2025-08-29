@@ -387,6 +387,14 @@ int main()
         morphologyEx(line_mask, line_mask, MORPH_CLOSE, kernel);
         morphologyEx(line_mask, line_mask, MORPH_OPEN, kernel);
 
+        // --- ROI analysis for corner detection (move up to define near_pixels early)
+        Rect roi_near(0, ROI_NEAR_Y, WIDTH, ROI_NEAR_H);
+        Rect roi_far(0, ROI_FAR_Y, WIDTH, ROI_FAR_H);
+        Mat mask_near = line_mask(roi_near);
+        Mat mask_far = line_mask(roi_far);
+        int near_pixels = countNonZero(mask_near);
+        int far_pixels = countNonZero(mask_far);
+
         // --- Calculate cx_near using fitLine on ROI_near
         Mat mask_near_full = line_mask(roi_near_rect);
         vector<vector<Point>> c_near_full;
@@ -426,14 +434,6 @@ int main()
         }
 
         // Use cx_near for PID control (no need for line_center_x anymore)
-
-        // --- ROI analysis for corner detection
-        Rect roi_near(0, ROI_NEAR_Y, WIDTH, ROI_NEAR_H);
-        Rect roi_far(0, ROI_FAR_Y, WIDTH, ROI_FAR_H);
-        Mat mask_near = line_mask(roi_near);
-        Mat mask_far = line_mask(roi_far);
-        int near_pixels = countNonZero(mask_near);
-        int far_pixels = countNonZero(mask_far);
 
         vector<vector<Point>> c_near;
         findContours(mask_near, c_near, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
