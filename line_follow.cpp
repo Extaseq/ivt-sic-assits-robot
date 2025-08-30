@@ -4,12 +4,108 @@
 #include <chrono>
 #include <thread>
 #include "LineFollow.hpp"
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 
 using namespace cv;
 
 #define REALSENSE_ERROR 1
 #define STD_ERROR 2
 #define UNKNOWN_ERROR 3
+
+// ==================== UART Functions ====================
+int open_uart(const char *dev = "/dev/ttyACM0", int baud = 115200)
+{
+    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0)
+    {
+        std::cerr << "Failed to open " << dev << ". Trying alternatives..." << std::endl;
+
+        // Thử các device khác
+        const char *alternatives[] = {"/dev/ttyUSB0", "/dev/ttyTHS1", "/dev/ttyAMA0"};
+        for (const char *alt_dev : alternatives)
+        {
+            fd = open(alt_dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+            if (fd >= 0)
+            {
+                std::cout << "Connected to " << alt_dev << std::endl;
+                break;
+            }
+        }
+
+        if (fd < 0)
+        {
+            std::cerr << "Could not open any UART device" << std::endl;
+            return -1;
+        }
+    }
+
+    termios tio{};
+    if (tcgetattr(fd, &tio) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+    // Cấu hình serial port
+    cfmakeraw(&tio);
+    tio.c_cflag &= ~PARENB; // No parity
+    tio.c_cflag &= ~CSTOPB; // 1 stop bit
+    tio.c_cflag &= ~CSIZE;
+    tio.c_cflag |= CS8;      // 8 data bits
+    tio.c_cflag &= ~CRTSCTS; // No hardware flow control
+    tio.c_cflag |= CREAD | CLOCAL;
+
+    tio.c_cc[VMIN] = 0;
+    tio.c_cc[VTIME] = 10; // Timeout in deciseconds
+
+    // Set baud rate
+    speed_t spd = B115200;
+    cfsetispeed(&tio, spd);
+    cfsetospeed(&tio, spd);
+
+    if (tcsetattr(fd, TCSANOW, &tio) != 0)
+    {
+        close(fd);
+        return -1;
+    }
+
+    // Clear buffer
+    tcflush(fd, TCIOFLUSH);
+
+    std::cout << "UART opened successfully: " << dev << std::endl;
+    return fd;
+}
+
+void send_motor_command(int fd, const char *id, float speed)
+{
+    if (fd < 0)
+        return;
+
+    // Convert speed from [-1, 1] to PWM value [0, 255]
+    int pwm = static_cast<int>((speed + 1.0f) * 127.5f);
+    pwm = std::max(0, std::min(255, pwm));
+
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%s %d\n", id, pwm);
+
+    ssize_t bytes_written = write(fd, buf, n);
+    if (bytes_written != n)
+    {
+        std::cerr << "UART write error: " << bytes_written << " bytes written, expected " << n << std::endl;
+    }
+
+    // Đảm bảo dữ liệu được gửi hoàn toàn
+    tcdrain(fd);
+    usleep(10000); // 10ms delay
+}
+
+void drive_motors(int fd, float left_speed, float right_speed)
+{
+    send_motor_command(fd, "M1", left_speed);
+    send_motor_command(fd, "M2", right_speed);
+}
 
 static const int WIDTH = 640, HEIGHT = 480, FPS = 30;
 static const int ROI_TOP = HEIGHT * 2 / 3;
@@ -28,6 +124,18 @@ try
 
     int centerX = WIDTH / 2;
     LineFollower follower(0.015f, 0.0f, 0.004f, 0.25f, 0.02f); // dt = 20ms = 0.02s
+
+    // Mở kết nối UART để điều khiển động cơ
+    int uart_fd = open_uart();
+    if (uart_fd < 0)
+    {
+        std::cerr << "Warning: UART not available. Running in simulation mode." << std::endl;
+    }
+    else
+    {
+        std::cout << "UART connected successfully." << std::endl;
+        sleep(2); // Đợi Arduino khởi động
+    }
 
     const double CONTROL_HZ = 50.0;
     const auto CONTROL_DT = std::chrono::milliseconds(100);
@@ -148,9 +256,16 @@ try
             }
         }
 
-        // TODO: Send vL and vR to motors here
-        (void)vL; // Suppress unused variable warning
-        (void)vR; // Suppress unused variable warning
+        // Send vL and vR to motors
+        if (uart_fd >= 0)
+        {
+            drive_motors(uart_fd, vL, vR);
+        }
+        else
+        {
+            // Simulation mode - just print values
+            std::cout << "[SIMULATION] MOTOR " << vL << " " << vR << std::endl;
+        }
 
         imshow("mask", mask);
         imshow("color", bgr);
@@ -161,6 +276,14 @@ try
         }
 
         std::this_thread::sleep_until(next_tick);
+    }
+
+    // Stop motors and close UART
+    if (uart_fd >= 0)
+    {
+        drive_motors(uart_fd, 0.0f, 0.0f); // Stop motors
+        close(uart_fd);
+        std::cout << "Motors stopped and UART closed." << std::endl;
     }
 
     pipe.stop();
