@@ -110,10 +110,6 @@ void drive_motors(int fd, float left_speed, float right_speed)
 static const int WIDTH = 640, HEIGHT = 480, FPS = 30;
 static const int ROI_TOP = HEIGHT * 2 / 3;
 
-// Line #010c21 ~ HSV(110, 247, 33) - Màu xanh navy rất đậm, gần đen
-Scalar LINE_LOW(95, 180, 20);     // H=95-125, S rất cao, V rất thấp 
-Scalar LINE_HIGH(125, 255, 60);   // Range cho màu rất tối #010c21
-
 int main()
 try
 {
@@ -123,7 +119,7 @@ try
     auto profile = pipe.start(cfg);
 
     int centerX = WIDTH / 2;
-    LineFollower follower(0.015f, 0.0f, 0.004f, 0.25f, 0.02f); // dt = 20ms = 0.02s
+    LineFollower follower(0.02f, 0.001f, 0.008f, 0.2f, 0.02f); // Improved PID
 
     // Mở kết nối UART để điều khiển động cơ
     int uart_fd = open_uart();
@@ -176,10 +172,6 @@ try
         }
 
         Mat bgr(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color.get_data(), Mat::AUTO_STEP);
-        
-        // Tăng contrast cho màu tối #010c21
-        Mat enhanced;
-        bgr.convertTo(enhanced, -1, 1.5, 20); // alpha=1.5 (contrast), beta=20 (brightness)
         
         // Đường tham chiếu: đường giữa ảnh & ranh giới ROI
         cv::line(bgr, Point(WIDTH / 2, 0), Point(WIDTH / 2, HEIGHT - 1), Scalar(255, 255, 0), 1, LINE_AA);
@@ -253,8 +245,10 @@ try
         contours = valid_contours;
 
         float vL = 0.0f, vR = 0.0f;
+        
         if (contours.empty())
-        { // Lost line
+        { 
+            // Lost line - turn logic
             line_lost_counter++;
             if (line_lost_counter >= TURN_THRESHOLD)
             {
@@ -272,7 +266,7 @@ try
                 vR = turn_direction * TURN_SPEED;
                 std::cout << "SEARCHING; TURN=" << (turn_direction > 0 ? "LEFT" : "RIGHT")
                           << " TIMER=" << turn_timer << "/" << MAX_TURN_TIME
-                          << " | MOTOR " << vL << " " << vR << "\n";
+                          << " | MOTOR " << vL << " " << vR << std::endl;
             }
             else
             {
@@ -280,82 +274,85 @@ try
                 vL = 0.0f;
                 vR = 0.0f;
                 std::cout << "MISS; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD
-                          << " | MOTOR " << vL << " " << vR << "\n";
+                          << " | MOTOR " << vL << " " << vR << std::endl;
             }
         }
         else
         {
-            auto cmax = *std::max_element(contours.begin(), contours.end(),
-                                          [](auto &a, auto &b)
-                                          { return contourArea(a) < contourArea(b); });
-            Moments M = moments(cmax);
-            if (M.m00 >= 1e-3)
-            {
-                int cx = int(M.m10 / M.m00);
-                // ====== VẼ OVERLAY KHI BẮT ĐƯỢC LINE ======
-                float err = float(cx - centerX);
-
-                // Reset line lost counter when line is found
-                line_lost_counter = 0;
-                turn_timer = 0; // Reset turn timer when line is found
-
-                // vẽ contour lớn nhất
-                drawContours(bgr, std::vector<std::vector<Point>>{cmax}, -1, Scalar(0, 255, 0), 2, LINE_AA);
-
-                // vẽ đường dọc qua centroid trong ROI
-                cv::line(bgr, Point(cx, ROI_TOP), Point(cx, HEIGHT - 1), Scalar(0, 255, 255), 2, LINE_AA);
-
-                // đánh dấu centroid
-                cv::circle(bgr, Point(cx, std::max(ROI_TOP + 1, HEIGHT - 5)), 4, Scalar(0, 0, 255), -1, LINE_AA);
-
-                // vẽ minAreaRect (giúp nhìn hướng của vạch)
-                RotatedRect rr = minAreaRect(cmax);
-                Point2f verts[4];
-                rr.points(verts);
-                for (int i = 0; i < 4; ++i)
-                    line(bgr, verts[i], verts[(i + 1) % 4], Scalar(0, 180, 255), 2, LINE_AA);
-
-                // in thông tin lỗi & tốc độ
-                char buf[128];
-                snprintf(buf, sizeof(buf), "cx=%d  err=%d  vL=%.2f vR=%.2f", cx, int(err), vL, vR);
-                putText(bgr, buf, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(50, 220, 50), 2, LINE_AA);
-
-                std::pair<float, float> motor_speeds = follower.update(cx, centerX);
-                vL = motor_speeds.first;
-                vR = motor_speeds.second;
-
-                std::cout << "OK; ERR=" << int(err)
-                          << " | MOTOR " << vL << " " << vR << "\n";
+            // Tìm contour tốt nhất (gần center và lớn)
+            std::vector<Point> best_contour;
+            float best_score = -1;
+            
+            for (const auto& contour : contours) {
+                RotatedRect rect = minAreaRect(contour);
+                float distance_from_center = abs(rect.center.x - centerX);
+                float area = contourArea(contour);
+                
+                // Score = area / distance_from_center (ưu tiên gần center và lớn)
+                float score = area / (distance_from_center + 1);
+                
+                if (score > best_score) {
+                    best_score = score;
+                    best_contour = contour;
+                }
             }
-            else
-            {
-                line_lost_counter++;
-                if (line_lost_counter >= TURN_THRESHOLD)
+            
+            if (!best_contour.empty()) {
+                Moments M = moments(best_contour);
+                if (M.m00 >= 1e-3)
                 {
-                    // Turn to search for line
-                    turn_timer++;
-                    if (turn_timer >= MAX_TURN_TIME)
-                    {
-                        // Switch turn direction after max turn time
-                        turn_direction = -turn_direction;
-                        turn_timer = 0;
-                        std::cout << "SWITCHING TURN DIRECTION TO " << (turn_direction > 0 ? "LEFT" : "RIGHT") << std::endl;
-                    }
+                    int cx = int(M.m10 / M.m00);
+                    int cy = int(M.m01 / M.m00);
                     
-                    vL = -turn_direction * TURN_SPEED;
-                    vR = turn_direction * TURN_SPEED;
-                    std::cout << "SEARCHING(m00); TURN=" << (turn_direction > 0 ? "LEFT" : "RIGHT")
-                              << " TIMER=" << turn_timer << "/" << MAX_TURN_TIME
-                              << " | MOTOR " << vL << " " << vR << "\n";
+                    // ====== VẼ OVERLAY KHI BẮT ĐƯỢC LINE ======
+                    float err = float(cx - centerX);
+
+                    // Reset line lost counter when line is found
+                    line_lost_counter = 0;
+                    turn_timer = 0;
+
+                    // vẽ contour được chọn
+                    drawContours(bgr, std::vector<std::vector<Point>>{best_contour}, -1, Scalar(0, 255, 0), 2, LINE_AA);
+
+                    // vẽ đường dọc qua centroid trong ROI
+                    cv::line(bgr, Point(cx, ROI_TOP), Point(cx, HEIGHT - 1), Scalar(0, 255, 255), 2, LINE_AA);
+
+                    // đánh dấu centroid
+                    cv::circle(bgr, Point(cx, cy), 6, Scalar(0, 0, 255), -1, LINE_AA);
+                    
+                    // Vẽ text hiển thị error
+                    char error_text[64];
+                    snprintf(error_text, sizeof(error_text), "ERR: %d", (int)err);
+                    putText(bgr, error_text, Point(cx + 10, cy - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 0), 1, LINE_AA);
+
+                    // Tính motor speeds từ PID controller
+                    std::pair<float, float> motor_speeds = follower.update(cx, centerX);
+                    vL = motor_speeds.first;
+                    vR = motor_speeds.second;
+                    
+                    // Giới hạn tốc độ để robot không đi quá nhanh
+                    float max_speed = 0.3f;
+                    vL = std::max(-max_speed, std::min(max_speed, vL));
+                    vR = std::max(-max_speed, std::min(max_speed, vR));
+
+                    // in thông tin lỗi & tốc độ
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "cx=%d cy=%d err=%.1f vL=%.2f vR=%.2f", cx, cy, err, vL, vR);
+                    putText(bgr, buf, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(50, 220, 50), 2, LINE_AA);
+
+                    std::cout << "FOLLOW; CX=" << cx << " ERR=" << int(err)
+                              << " | MOTOR L=" << vL << " R=" << vR << std::endl;
                 }
-                else
-                {
-                    // Brief pause before turning
-                    vL = 0.0f;
-                    vR = 0.0f;
-                    std::cout << "MISS(m00); COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD
-                              << " | MOTOR " << vL << " " << vR << "\n";
+                else {
+                    // Contour quá nhỏ
+                    line_lost_counter++;
+                    std::cout << "CONTOUR_SMALL; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD << std::endl;
                 }
+            }
+            else {
+                // Không có contour phù hợp
+                line_lost_counter++;
+                std::cout << "NO_VALID_CONTOUR; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD << std::endl;
             }
         }
 
