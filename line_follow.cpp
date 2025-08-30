@@ -83,9 +83,9 @@ void send_motor_command(int fd, const char *id, float speed)
     if (fd < 0)
         return;
 
-    // Convert speed from [-1, 1] to PWM value [0, 255]
-    int pwm = static_cast<int>((speed + 1.0f) * 127.5f);
-    pwm = std::max(0, std::min(255, pwm));
+    // Convert speed from [-1, 1] to PWM value [-255, 255]
+    int pwm = static_cast<int>(speed * 255.0f);
+    pwm = std::max(-255, std::min(255, pwm));
 
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%s %d\n", id, pwm);
@@ -95,6 +95,9 @@ void send_motor_command(int fd, const char *id, float speed)
     {
         std::cerr << "UART write error: " << bytes_written << " bytes written, expected " << n << std::endl;
     }
+    
+    // Debug: In giá trị PWM được gửi
+    std::cout << "UART_CMD: " << id << " " << pwm << " (from speed=" << speed << ")" << std::endl;
 
     // Đảm bảo dữ liệu được gửi hoàn toàn
     tcdrain(fd);
@@ -103,8 +106,13 @@ void send_motor_command(int fd, const char *id, float speed)
 
 void drive_motors(int fd, float left_speed, float right_speed)
 {
-    send_motor_command(fd, "M1", left_speed);
-    send_motor_command(fd, "M2", right_speed);
+    // Nếu robot đi sai hướng, đổi M1 và M2:
+    send_motor_command(fd, "M2", left_speed);   // M2 = bánh trái
+    send_motor_command(fd, "M1", right_speed);  // M1 = bánh phải
+    
+    // Nếu cần đảo chiều, uncomment dòng dưới:
+    // send_motor_command(fd, "M2", -left_speed);
+    // send_motor_command(fd, "M1", -right_speed);
 }
 
 static const int WIDTH = 640, HEIGHT = 480, FPS = 30;
