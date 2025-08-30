@@ -8,5 +8,5 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(realsense2 REQUIRED)
 find_package(OpenCV REQUIRED)
-add_executable(ivt_sic_assits_robot running.cpp)
+add_executable(ivt_sic_assits_robot line_follow.cpp)
 target_link_libraries(ivt_sic_assits_robot PRIVATE realsense2::realsense2 ${OpenCV_LIBS})

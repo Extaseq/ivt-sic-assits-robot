@@ -110,9 +110,9 @@ void drive_motors(int fd, float left_speed, float right_speed)
 static const int WIDTH = 640, HEIGHT = 480, FPS = 30;
 static const int ROI_TOP = HEIGHT * 2 / 3;
 
-// Line #214ea3 ~ HSV(109, 203, 163)
-Scalar LINE_LOW(100, 120, 80);
-Scalar LINE_HIGH(120, 255, 255);
+// Line #010c21 ~ HSV(110, 247, 33) - Màu xanh navy rất đậm, gần đen
+Scalar LINE_LOW(95, 180, 20);     // H=95-125, S rất cao, V rất thấp 
+Scalar LINE_HIGH(125, 255, 60);   // Range cho màu rất tối #010c21
 
 int main()
 try
@@ -139,6 +139,14 @@ try
 
     const double CONTROL_HZ = 50.0;
     const auto CONTROL_DT = std::chrono::milliseconds(100);
+
+    // Line following state variables
+    int line_lost_counter = 0;
+    const int TURN_THRESHOLD = 15; // 15 frames = 0.3 seconds at 50Hz
+    const float TURN_SPEED = 0.2f;
+    int turn_direction = 1; // 1 = left, -1 = right (start with left turn)
+    const int MAX_TURN_TIME = 100; // 100 frames = 2 seconds at 50Hz
+    int turn_timer = 0;
 
     std::cout << "Press [ESC] to quit.\n";
     auto next_tick = std::chrono::steady_clock::now();
@@ -168,45 +176,112 @@ try
         }
 
         Mat bgr(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color.get_data(), Mat::AUTO_STEP);
+        
+        // Tăng contrast cho màu tối #010c21
+        Mat enhanced;
+        bgr.convertTo(enhanced, -1, 1.5, 20); // alpha=1.5 (contrast), beta=20 (brightness)
+        
         // Đường tham chiếu: đường giữa ảnh & ranh giới ROI
         cv::line(bgr, Point(WIDTH / 2, 0), Point(WIDTH / 2, HEIGHT - 1), Scalar(255, 255, 0), 1, LINE_AA);
         cv::line(bgr, Point(0, ROI_TOP), Point(WIDTH - 1, ROI_TOP), Scalar(200, 200, 200), 1, LINE_AA);
 
-        // ==== BGR-based mask: Blue-dominant ====
-        const int T = 30;    // biên chênh: B phải lớn hơn R/G ít nhất T
-        const int Vmin = 60; // ngưỡng “độ sáng” tối thiểu (max(B,G,R))
+        // ==== EDGE-BASED DETECTION thay vì color-based ====
+        // Chuyển sang grayscale cho edge detection
+        Mat gray;
+        cvtColor(bgr, gray, COLOR_BGR2GRAY);
+        
+        // Method 1: Adaptive threshold để tìm vùng tối
+        Mat thresh;
+        adaptiveThreshold(gray, thresh, 255, ADAPTIVE_THRESH_MEAN_C, THRESH_BINARY_INV, 15, 10);
+        
+        // Method 2: Canny edge detection
+        Mat blurred;
+        GaussianBlur(gray, blurred, Size(5, 5), 1.5);
+        Mat edges;
+        Canny(blurred, edges, 30, 90, 3);
+        
+        // Kết hợp adaptive threshold và edges
+        Mat mask_combined;
+        bitwise_or(thresh, edges, mask_combined);
+        
+        // Chỉ xét vùng ROI
+        Mat roi_mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
+        roi_mask(Range(ROI_TOP, HEIGHT), Range::all()) = 255;
+        bitwise_and(mask_combined, roi_mask, mask_combined);
+        
+        // Morphology để tạo line liên tục
+        Mat k1 = getStructuringElement(MORPH_RECT, Size(3, 3));
+        morphologyEx(mask_combined, mask_combined, MORPH_CLOSE, k1, Point(-1, -1), 1);
+        
+        Mat k2 = getStructuringElement(MORPH_ELLIPSE, Size(5, 1)); // Kernel ngang để nối line
+        morphologyEx(mask_combined, mask_combined, MORPH_OPEN, k2, Point(-1, -1), 1);
+        
+        Mat mask = mask_combined.clone();
 
-        Mat mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
-
-        // Chỉ quét vùng ROI 1/3 dưới ảnh để giảm nhiễu & tiết kiệm CPU
-        for (int y = ROI_TOP; y < HEIGHT; ++y)
-        {
-            const Vec3b *row = bgr.ptr<Vec3b>(y); // B,G,R
-            uchar *mrow = mask.ptr<uchar>(y);
-            for (int x = 0; x < WIDTH; ++x)
-            {
-                int B = row[x][0], G = row[x][1], R = row[x][2];
-                int V = std::max({B, G, R});
-                if (B > G + T && B > R + T && V >= Vmin)
-                {
-                    mrow[x] = 255;
-                }
-            }
+        // DEBUG: In thông tin về detection methods
+        static int debug_counter = 0;
+        if (debug_counter % 30 == 0) {
+            std::cout << "Adaptive thresh pixels: " << countNonZero(thresh) 
+                      << " | Edge pixels: " << countNonZero(edges)
+                      << " | Combined mask: " << countNonZero(mask) << std::endl;
         }
-
-        // Lọc morphology như cũ (có thể giữ nguyên kernel 5x5 và 2 lần closing)
-        Mat k = getStructuringElement(MORPH_RECT, Size(5, 5));
-        morphologyEx(mask, mask, MORPH_CLOSE, k, Point(-1, -1), 2);
+        debug_counter++;
 
         std::vector<std::vector<Point>> contours;
         findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
+        // Lọc contours theo hình dạng line và vị trí
+        std::vector<std::vector<Point>> valid_contours;
+        for (const auto& contour : contours) {
+            double area = contourArea(contour);
+            if (area < 30 || area > 3000) continue; // Mở rộng range cho edge detection
+            
+            RotatedRect rect = minAreaRect(contour);
+            float aspect_ratio = std::max(rect.size.width, rect.size.height) / 
+                               std::min(rect.size.width, rect.size.height);
+            
+            // Giảm yêu cầu aspect ratio vì edge có thể không liên tục
+            if (aspect_ratio > 2.0f && rect.center.y > ROI_TOP) {
+                // Thêm filter theo vị trí: ưu tiên contour gần center
+                float distance_from_center = abs(rect.center.x - WIDTH/2);
+                if (distance_from_center < WIDTH/3) { // Trong 1/3 giữa ảnh
+                    valid_contours.push_back(contour);
+                }
+            }
+        }
+        
+        contours = valid_contours;
+
         float vL = 0.0f, vR = 0.0f;
         if (contours.empty())
         { // Lost line
-            vL = -0.15f;
-            vR = 0.15f;
-            std::cout << "MISS; MOTOR " << vL << " " << vR << "\n";
+            line_lost_counter++;
+            if (line_lost_counter >= TURN_THRESHOLD)
+            {
+                // Turn to search for line
+                turn_timer++;
+                if (turn_timer >= MAX_TURN_TIME)
+                {
+                    // Switch turn direction after max turn time
+                    turn_direction = -turn_direction;
+                    turn_timer = 0;
+                    std::cout << "SWITCHING TURN DIRECTION TO " << (turn_direction > 0 ? "LEFT" : "RIGHT") << std::endl;
+                }
+                
+                vL = -turn_direction * TURN_SPEED;
+                vR = turn_direction * TURN_SPEED;
+                std::cout << "SEARCHING; TURN=" << (turn_direction > 0 ? "LEFT" : "RIGHT")
+                          << " TIMER=" << turn_timer << "/" << MAX_TURN_TIME
+                          << " | MOTOR " << vL << " " << vR << "\n";
+            }
+            else
+            {
+                // Brief pause before turning
+                vL = 0.0f;
+                vR = 0.0f;
+                std::cout << "MISS; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD
+                          << " | MOTOR " << vL << " " << vR << "\n";
+            }
         }
         else
         {
@@ -219,6 +294,10 @@ try
                 int cx = int(M.m10 / M.m00);
                 // ====== VẼ OVERLAY KHI BẮT ĐƯỢC LINE ======
                 float err = float(cx - centerX);
+
+                // Reset line lost counter when line is found
+                line_lost_counter = 0;
+                turn_timer = 0; // Reset turn timer when line is found
 
                 // vẽ contour lớn nhất
                 drawContours(bgr, std::vector<std::vector<Point>>{cmax}, -1, Scalar(0, 255, 0), 2, LINE_AA);
@@ -250,9 +329,33 @@ try
             }
             else
             {
-                vL = -0.15f;
-                vR = 0.15f;
-                std::cout << "MISS(m00); MOTOR " << vL << " " << vR << "\n";
+                line_lost_counter++;
+                if (line_lost_counter >= TURN_THRESHOLD)
+                {
+                    // Turn to search for line
+                    turn_timer++;
+                    if (turn_timer >= MAX_TURN_TIME)
+                    {
+                        // Switch turn direction after max turn time
+                        turn_direction = -turn_direction;
+                        turn_timer = 0;
+                        std::cout << "SWITCHING TURN DIRECTION TO " << (turn_direction > 0 ? "LEFT" : "RIGHT") << std::endl;
+                    }
+                    
+                    vL = -turn_direction * TURN_SPEED;
+                    vR = turn_direction * TURN_SPEED;
+                    std::cout << "SEARCHING(m00); TURN=" << (turn_direction > 0 ? "LEFT" : "RIGHT")
+                              << " TIMER=" << turn_timer << "/" << MAX_TURN_TIME
+                              << " | MOTOR " << vL << " " << vR << "\n";
+                }
+                else
+                {
+                    // Brief pause before turning
+                    vL = 0.0f;
+                    vR = 0.0f;
+                    std::cout << "MISS(m00); COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD
+                              << " | MOTOR " << vL << " " << vR << "\n";
+                }
             }
         }
 
@@ -269,6 +372,9 @@ try
 
         imshow("mask", mask);
         imshow("color", bgr);
+        imshow("gray", gray);           // Để xem grayscale
+        imshow("adaptive", thresh);     // Để xem adaptive threshold
+        imshow("edges", edges);         // Để xem edge detection
 
         if (waitKey(1) == 27)
         {
