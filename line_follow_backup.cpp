@@ -3,6 +3,7 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include "LineFollow.hpp"
 #include <fcntl.h>
 #include <termios.h>
@@ -83,9 +84,9 @@ void send_motor_command(int fd, const char *id, float speed)
     if (fd < 0)
         return;
 
-    // Convert speed from [-1, 1] to PWM value [0, 255]
-    int pwm = static_cast<int>((speed + 1.0f) * 127.5f);
-    pwm = std::max(0, std::min(255, pwm));
+    // Convert speed from [-1, 1] to PWM value [-255, 255]
+    int pwm = static_cast<int>(speed * 255.0f);
+    pwm = std::max(-255, std::min(255, pwm));
 
     char buf[32];
     int n = snprintf(buf, sizeof(buf), "%s %d\n", id, pwm);
@@ -95,6 +96,9 @@ void send_motor_command(int fd, const char *id, float speed)
     {
         std::cerr << "UART write error: " << bytes_written << " bytes written, expected " << n << std::endl;
     }
+    
+    // Debug: In giá trị PWM được gửi
+    std::cout << "UART_CMD: " << id << " " << pwm << " (from speed=" << speed << ")" << std::endl;
 
     // Đảm bảo dữ liệu được gửi hoàn toàn
     tcdrain(fd);
@@ -103,16 +107,122 @@ void send_motor_command(int fd, const char *id, float speed)
 
 void drive_motors(int fd, float left_speed, float right_speed)
 {
-    send_motor_command(fd, "M1", left_speed);
-    send_motor_command(fd, "M2", right_speed);
+    // Nếu robot đi sai hướng, đổi M1 và M2:
+    send_motor_command(fd, "M2", left_speed);   // M2 = bánh trái
+    send_motor_command(fd, "M1", right_speed);  // M1 = bánh phải
+    
+    // Nếu cần đảo chiều, uncomment dòng dưới:
+    // send_motor_command(fd, "M2", -left_speed);
+    // send_motor_command(fd, "M1", -right_speed);
 }
 
 static const int WIDTH = 640, HEIGHT = 480, FPS = 30;
 static const int ROI_TOP = HEIGHT * 2 / 3;
 
-// Line #010c21 ~ HSV(110, 247, 33) - Màu xanh navy rất đậm, gần đen
-Scalar LINE_LOW(95, 180, 20);     // H=95-125, S rất cao, V rất thấp 
-Scalar LINE_HIGH(125, 255, 60);   // Range cho màu rất tối #010c21
+// ==================== FSM States ====================
+enum class RobotState {
+    GO_STRAIGHT_1,      // First straight segment
+    TURN_LEFT_90,       // Turn left 90 degrees
+    GO_STRAIGHT_2,      // Second straight segment  
+    TURN_RIGHT_90,      // Turn right 90 degrees
+    GO_STRAIGHT_3       // Third straight segment
+};
+
+// ==================== FSM Configuration ====================
+struct FSMConfig {
+    // Time durations for each state (in seconds)
+    float straight1_duration = 3.0f;    // First straight: 3 seconds
+    float turn_left_duration = 1.5f;    // Turn left: 1.5 seconds
+    float straight2_duration = 2.0f;    // Second straight: 2 seconds
+    float turn_right_duration = 1.5f;   // Turn right: 1.5 seconds
+    float straight3_duration = 3.0f;    // Third straight: 3 seconds
+    
+    // Speed settings
+    float max_speed = 1.0f;              // Max speed (maps to 255 PWM)
+    float turn_speed = 0.6f;             // Turn speed
+    float speed_reduction = 0.7f;        // Speed when correcting (70% of max)
+    float correction_duration = 0.5f;    // Correction duration in seconds
+    
+    // Line detection thresholds
+    int black_threshold = 60;            // Gray values below this are considered black (0-255)
+    int min_distance_to_line = 30;       // Minimum distance from VML to line edge (pixels)
+    int vml_left_threshold = 50;         // Pixels from left edge to trigger correction
+    int vml_right_threshold = 50;        // Pixels from right edge to trigger correction
+};
+
+// ==================== Line Detection for Two White Lines ====================
+struct LineDetection {
+    bool found_lines = false;
+    int left_line_x = -1;
+    int right_line_x = -1;
+    int virtual_middle_line = -1;
+    bool too_close_to_left = false;
+    bool too_close_to_right = false;
+};
+
+LineDetection detect_two_white_lines(const Mat& mask, const FSMConfig& config) {
+    LineDetection result;
+    
+    // Find contours in the black line mask
+    std::vector<std::vector<Point>> contours;
+    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+    
+    // Filter contours to find black line segments
+    std::vector<std::pair<int, std::vector<Point>>> valid_lines;
+    
+    for (const auto& contour : contours) {
+        double area = contourArea(contour);
+        if (area < 30 || area > 5000) continue; // Filter by area for black lines
+        
+        RotatedRect rect = minAreaRect(contour);
+        float aspect_ratio = std::max(rect.size.width, rect.size.height) / 
+                           std::min(rect.size.width, rect.size.height);
+        
+        // Accept line-like contours (black lines should be elongated)
+        if (aspect_ratio > 2.0f && rect.center.y > ROI_TOP) {
+            Moments M = moments(contour);
+            if (M.m00 >= 1e-3) {
+                int cx = int(M.m10 / M.m00);
+                valid_lines.push_back({cx, contour});
+            }
+        }
+    }
+    
+    // Sort by x position
+    std::sort(valid_lines.begin(), valid_lines.end(), 
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    
+    // Look for at least 2 black lines (left and right borders)
+    if (valid_lines.size() >= 2) {
+        result.found_lines = true;
+        result.left_line_x = valid_lines[0].first;          // Left black line
+        result.right_line_x = valid_lines[valid_lines.size()-1].first; // Right black line
+        
+        // Calculate virtual middle line between the two black lines
+        result.virtual_middle_line = (result.left_line_x + result.right_line_x) / 2;
+        
+        // Check if VML is too close to either black line
+        int distance_to_left = result.virtual_middle_line - result.left_line_x;
+        int distance_to_right = result.right_line_x - result.virtual_middle_line;
+        
+        result.too_close_to_left = distance_to_left < config.vml_left_threshold;
+        result.too_close_to_right = distance_to_right < config.vml_right_threshold;
+        
+        // Debug output for black line detection
+        static int debug_counter = 0;
+        if (debug_counter % 30 == 0) {
+            std::cout << "Black lines detected: L=" << result.left_line_x 
+                      << " R=" << result.right_line_x 
+                      << " VML=" << result.virtual_middle_line
+                      << " DistL=" << distance_to_left
+                      << " DistR=" << distance_to_right 
+                      << " Total black lines=" << valid_lines.size() << std::endl;
+        }
+        debug_counter++;
+    }
+    
+    return result;
+}
 
 int main()
 try
@@ -123,7 +233,6 @@ try
     auto profile = pipe.start(cfg);
 
     int centerX = WIDTH / 2;
-    LineFollower follower(0.02f, 0.001f, 0.008f, 0.2f, 0.02f); // Tăng Kp và Kd cho responsive hơn
 
     // Mở kết nối UART để điều khiển động cơ
     int uart_fd = open_uart();
@@ -138,22 +247,30 @@ try
     }
 
     const double CONTROL_HZ = 50.0;
-    const auto CONTROL_DT = std::chrono::milliseconds(100);
+    const auto CONTROL_DT = std::chrono::milliseconds(20); // 50Hz = 20ms
 
-    // Line following state variables
-    int line_lost_counter = 0;
-    const int TURN_THRESHOLD = 15; // 15 frames = 0.3 seconds at 50Hz
-    const float TURN_SPEED = 0.2f;
-    int turn_direction = 1; // 1 = left, -1 = right (start with left turn)
-    const int MAX_TURN_TIME = 100; // 100 frames = 2 seconds at 50Hz
-    int turn_timer = 0;
+    // ==================== FSM Variables ====================
+    FSMConfig config;
+    RobotState current_state = RobotState::GO_STRAIGHT_1;
+    auto state_start_time = std::chrono::steady_clock::now();
+    auto correction_start_time = std::chrono::steady_clock::now();
+    bool in_correction = false;
+    bool correcting_right_wheel = false; // true = reducing right wheel, false = reducing left wheel
 
+    std::cout << "FSM Line Following Robot Started!" << std::endl;
+    std::cout << "States: STRAIGHT1 -> TURN_LEFT -> STRAIGHT2 -> TURN_RIGHT -> STRAIGHT3" << std::endl;
     std::cout << "Press [ESC] to quit.\n";
+    
     auto next_tick = std::chrono::steady_clock::now();
 
     while (true)
     {
         next_tick += CONTROL_DT;
+        auto current_time = std::chrono::steady_clock::now();
+        
+        // Calculate state duration
+        auto state_duration = std::chrono::duration<float>(current_time - state_start_time).count();
+        auto correction_duration = std::chrono::duration<float>(current_time - correction_start_time).count();
 
         rs2::frameset fs;
         try
@@ -162,8 +279,7 @@ try
         }
         catch (...)
         {
-            float vL = -0.12f, vR = 0.12f;
-            std::cout << "TIMEOUT; MOTOR " << vL << " " << vR << "\n";
+            std::cout << "TIMEOUT; Continuing..." << std::endl;
             std::this_thread::sleep_until(next_tick);
             continue;
         }
@@ -177,248 +293,295 @@ try
 
         Mat bgr(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color.get_data(), Mat::AUTO_STEP);
         
-        // Tăng contrast cho màu tối #010c21
-        Mat enhanced;
-        bgr.convertTo(enhanced, -1, 1.5, 20); // alpha=1.5 (contrast), beta=20 (brightness)
-        
-        // Đường tham chiếu: đường giữa ảnh & ranh giới ROI
+        // Draw reference lines
         cv::line(bgr, Point(WIDTH / 2, 0), Point(WIDTH / 2, HEIGHT - 1), Scalar(255, 255, 0), 1, LINE_AA);
         cv::line(bgr, Point(0, ROI_TOP), Point(WIDTH - 1, ROI_TOP), Scalar(200, 200, 200), 1, LINE_AA);
 
-        // ==== EDGE-BASED DETECTION thay vì color-based ====
-        // Chuyển sang grayscale cho edge detection
+        // ==================== Image Processing ====================
         Mat gray;
         cvtColor(bgr, gray, COLOR_BGR2GRAY);
         
-        // Method 1: Adaptive threshold để tìm vùng tối
-        Mat thresh;
-        adaptiveThreshold(gray, thresh, 255, ADAPTIVE_THRESH_MEAN_C, THRESH_BINARY_INV, 15, 10);
+        // Direct black line detection using threshold
+        Mat black_mask;
+        threshold(gray, black_mask, config.black_threshold, 255, THRESH_BINARY_INV); // Detect dark/black pixels
         
-        // Method 2: Canny edge detection
-        Mat blurred;
-        GaussianBlur(gray, blurred, Size(5, 5), 1.5);
-        Mat edges;
-        Canny(blurred, edges, 30, 90, 3);
-        
-        // Kết hợp adaptive threshold và edges
-        Mat mask_combined;
-        bitwise_or(thresh, edges, mask_combined);
-        
-        // Chỉ xét vùng ROI
+        // ROI filtering - only process bottom third of image
         Mat roi_mask = Mat::zeros(HEIGHT, WIDTH, CV_8U);
         roi_mask(Range(ROI_TOP, HEIGHT), Range::all()) = 255;
-        bitwise_and(mask_combined, roi_mask, mask_combined);
+        bitwise_and(black_mask, roi_mask, black_mask);
         
-        // Morphology để tạo line liên tục
+        // Morphology to clean up noise and connect line segments
         Mat k1 = getStructuringElement(MORPH_RECT, Size(3, 3));
-        morphologyEx(mask_combined, mask_combined, MORPH_CLOSE, k1, Point(-1, -1), 1);
+        morphologyEx(black_mask, black_mask, MORPH_CLOSE, k1, Point(-1, -1), 2);
         
-        Mat k2 = getStructuringElement(MORPH_ELLIPSE, Size(5, 1)); // Kernel ngang để nối line
-        morphologyEx(mask_combined, mask_combined, MORPH_OPEN, k2, Point(-1, -1), 1);
+        // Remove small noise
+        Mat k2 = getStructuringElement(MORPH_RECT, Size(2, 2));
+        morphologyEx(black_mask, black_mask, MORPH_OPEN, k2, Point(-1, -1), 1);
         
-        Mat mask = mask_combined.clone();
+        Mat mask = black_mask.clone();
 
-        // DEBUG: In thông tin về detection methods
-        static int debug_counter = 0;
-        if (debug_counter % 30 == 0) {
-            std::cout << "Adaptive thresh pixels: " << countNonZero(thresh) 
-                      << " | Edge pixels: " << countNonZero(edges)
-                      << " | Combined mask: " << countNonZero(mask) << std::endl;
-        }
-        debug_counter++;
+        // ==================== Line Detection ====================
+        LineDetection lines = detect_two_white_lines(mask, config);
 
-        std::vector<std::vector<Point>> contours;
-        findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-
-        // Lọc contours theo hình dạng line và vị trí
-        std::vector<std::vector<Point>> valid_contours;
-        for (const auto& contour : contours) {
-            double area = contourArea(contour);
-            if (area < 30 || area > 3000) continue; // Mở rộng range cho edge detection
-            
-            RotatedRect rect = minAreaRect(contour);
-            float aspect_ratio = std::max(rect.size.width, rect.size.height) / 
-                               std::min(rect.size.width, rect.size.height);
-            
-            // Giảm yêu cầu aspect ratio vì edge có thể không liên tục
-            if (aspect_ratio > 2.0f && rect.center.y > ROI_TOP) {
-                // Thêm filter theo vị trí: ưu tiên contour gần center
-                float distance_from_center = abs(rect.center.x - WIDTH/2);
-                if (distance_from_center < WIDTH/3) { // Trong 1/3 giữa ảnh
-                    valid_contours.push_back(contour);
-                }
-            }
-        }
-        
-        contours = valid_contours;
-
+        // ==================== FSM State Machine ====================
         float vL = 0.0f, vR = 0.0f;
-        if (contours.empty())
-        { // Lost line
-            line_lost_counter++;
-            if (line_lost_counter >= TURN_THRESHOLD)
-            {
-                // Turn to search for line
-                turn_timer++;
-                if (turn_timer >= MAX_TURN_TIME)
-                {
-                    // Switch turn direction after max turn time
-                    turn_direction = -turn_direction;
-                    turn_timer = 0;
-                    std::cout << "SWITCHING TURN DIRECTION TO " << (turn_direction > 0 ? "LEFT" : "RIGHT") << std::endl;
+        std::string state_name = "UNKNOWN";
+        bool should_transition = false;
+
+        switch (current_state) {
+            case RobotState::GO_STRAIGHT_1:
+                state_name = "STRAIGHT_1";
+                should_transition = (state_duration >= config.straight1_duration);
+                
+                if (lines.found_lines) {
+                    // Default: max speed forward
+                    vL = vR = config.max_speed;
+                    
+                    // Check for correction needs
+                    if (!in_correction) {
+                        if (lines.too_close_to_left) {
+                            // VML too close to left line - reduce right wheel speed
+                            in_correction = true;
+                            correcting_right_wheel = true;
+                            correction_start_time = current_time;
+                            std::cout << "CORRECTION: VML too close to LEFT line - reducing RIGHT wheel" << std::endl;
+                        }
+                        else if (lines.too_close_to_right) {
+                            // VML too close to right line - reduce left wheel speed
+                            in_correction = true;
+                            correcting_right_wheel = false;
+                            correction_start_time = current_time;
+                            std::cout << "CORRECTION: VML too close to RIGHT line - reducing LEFT wheel" << std::endl;
+                        }
+                    }
+                    
+                    // Apply correction if active
+                    if (in_correction) {
+                        if (correction_duration < config.correction_duration) {
+                            if (correcting_right_wheel) {
+                                vR = config.max_speed * config.speed_reduction;
+                            } else {
+                                vL = config.max_speed * config.speed_reduction;
+                            }
+                        } else {
+                            // Correction time expired - return to normal
+                            in_correction = false;
+                            std::cout << "CORRECTION: Returning to normal speed" << std::endl;
+                        }
+                    }
+                } else {
+                    // No lines detected - just go straight
+                    vL = vR = config.max_speed;
                 }
                 
-                vL = -turn_direction * TURN_SPEED;
-                vR = turn_direction * TURN_SPEED;
-                std::cout << "SEARCHING; TURN=" << (turn_direction > 0 ? "LEFT" : "RIGHT")
-                          << " TIMER=" << turn_timer << "/" << MAX_TURN_TIME
-                          << " | MOTOR " << vL << " " << vR << "\n";
-            }
-            else
-            {
-                // Brief pause before turning
-                vL = 0.0f;
-                vR = 0.0f;
-                std::cout << "MISS; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD
-                          << " | MOTOR " << vL << " " << vR << "\n";
-            }
+                if (should_transition) {
+                    current_state = RobotState::TURN_LEFT_90;
+                    state_start_time = current_time;
+                    in_correction = false;
+                    std::cout << "STATE TRANSITION: STRAIGHT_1 -> TURN_LEFT_90" << std::endl;
+                }
+                break;
+
+            case RobotState::TURN_LEFT_90:
+                state_name = "TURN_LEFT_90";
+                should_transition = (state_duration >= config.turn_left_duration);
+                
+                // Turn left: left wheel slower, right wheel faster
+                vL = -config.turn_speed;
+                vR = config.turn_speed;
+                
+                if (should_transition) {
+                    current_state = RobotState::GO_STRAIGHT_2;
+                    state_start_time = current_time;
+                    std::cout << "STATE TRANSITION: TURN_LEFT_90 -> STRAIGHT_2" << std::endl;
+                }
+                break;
+
+            case RobotState::GO_STRAIGHT_2:
+                state_name = "STRAIGHT_2";
+                should_transition = (state_duration >= config.straight2_duration);
+                
+                // Same line following logic as STRAIGHT_1
+                if (lines.found_lines) {
+                    vL = vR = config.max_speed;
+                    
+                    if (!in_correction) {
+                        if (lines.too_close_to_left) {
+                            in_correction = true;
+                            correcting_right_wheel = true;
+                            correction_start_time = current_time;
+                            std::cout << "CORRECTION: VML too close to LEFT line - reducing RIGHT wheel" << std::endl;
+                        }
+                        else if (lines.too_close_to_right) {
+                            in_correction = true;
+                            correcting_right_wheel = false;
+                            correction_start_time = current_time;
+                            std::cout << "CORRECTION: VML too close to RIGHT line - reducing LEFT wheel" << std::endl;
+                        }
+                    }
+                    
+                    if (in_correction) {
+                        if (correction_duration < config.correction_duration) {
+                            if (correcting_right_wheel) {
+                                vR = config.max_speed * config.speed_reduction;
+                            } else {
+                                vL = config.max_speed * config.speed_reduction;
+                            }
+                        } else {
+                            in_correction = false;
+                            std::cout << "CORRECTION: Returning to normal speed" << std::endl;
+                        }
+                    }
+                } else {
+                    vL = vR = config.max_speed;
+                }
+                
+                if (should_transition) {
+                    current_state = RobotState::TURN_RIGHT_90;
+                    state_start_time = current_time;
+                    in_correction = false;
+                    std::cout << "STATE TRANSITION: STRAIGHT_2 -> TURN_RIGHT_90" << std::endl;
+                }
+                break;
+
+            case RobotState::TURN_RIGHT_90:
+                state_name = "TURN_RIGHT_90";
+                should_transition = (state_duration >= config.turn_right_duration);
+                
+                // Turn right: left wheel faster, right wheel slower
+                vL = config.turn_speed;
+                vR = -config.turn_speed;
+                
+                if (should_transition) {
+                    current_state = RobotState::GO_STRAIGHT_3;
+                    state_start_time = current_time;
+                    std::cout << "STATE TRANSITION: TURN_RIGHT_90 -> STRAIGHT_3" << std::endl;
+                }
+                break;
+
+            case RobotState::GO_STRAIGHT_3:
+                state_name = "STRAIGHT_3";
+                should_transition = (state_duration >= config.straight3_duration);
+                
+                // Same line following logic
+                if (lines.found_lines) {
+                    vL = vR = config.max_speed;
+                    
+                    if (!in_correction) {
+                        if (lines.too_close_to_left) {
+                            in_correction = true;
+                            correcting_right_wheel = true;
+                            correction_start_time = current_time;
+                            std::cout << "CORRECTION: VML too close to LEFT line - reducing RIGHT wheel" << std::endl;
+                        }
+                        else if (lines.too_close_to_right) {
+                            in_correction = true;
+                            correcting_right_wheel = false;
+                            correction_start_time = current_time;
+                            std::cout << "CORRECTION: VML too close to RIGHT line - reducing LEFT wheel" << std::endl;
+                        }
+                    }
+                    
+                    if (in_correction) {
+                        if (correction_duration < config.correction_duration) {
+                            if (correcting_right_wheel) {
+                                vR = config.max_speed * config.speed_reduction;
+                            } else {
+                                vL = config.max_speed * config.speed_reduction;
+                            }
+                        } else {
+                            in_correction = false;
+                            std::cout << "CORRECTION: Returning to normal speed" << std::endl;
+                        }
+                    }
+                } else {
+                    vL = vR = config.max_speed;
+                }
+                
+                if (should_transition) {
+                    // Mission complete - stop or restart
+                    vL = vR = 0.0f;
+                    std::cout << "MISSION COMPLETE! Stopping robot." << std::endl;
+                }
+                break;
         }
-        else
-        {
-            // Tìm contour lớn nhất hoặc contour gần center nhất
-            std::vector<Point> best_contour;
-            float best_score = -1;
-            
-            for (const auto& contour : contours) {
-                RotatedRect rect = minAreaRect(contour);
-                float distance_from_center = abs(rect.center.x - centerX);
-                float area = contourArea(contour);
+
+        // ==================== Visual Feedback ====================
+        
+        // Draw all detected black line contours for debugging
+        std::vector<std::vector<Point>> debug_contours;
+        findContours(mask, debug_contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+        
+        // Draw all contours in blue for visualization
+        for (size_t i = 0; i < debug_contours.size(); i++) {
+            double area = contourArea(debug_contours[i]);
+            if (area > 30) { // Only draw significant contours
+                drawContours(bgr, debug_contours, (int)i, Scalar(255, 0, 0), 2); // Blue contours
                 
-                // Score = area / distance_from_center (ưu tiên gần center và lớn)
-                float score = area / (distance_from_center + 1);
-                
-                if (score > best_score) {
-                    best_score = score;
-                    best_contour = contour;
-                }
-            }
-            
-            if (!best_contour.empty()) {
-                Moments M = moments(best_contour);
-                if (M.m00 >= 1e-3)
-                {
+                // Draw centroid of each contour
+                Moments M = moments(debug_contours[i]);
+                if (M.m00 >= 1e-3) {
                     int cx = int(M.m10 / M.m00);
                     int cy = int(M.m01 / M.m00);
-                    
-                    // ====== VẼ OVERLAY KHI BẮT ĐƯỢC LINE ======
-                    float err = float(cx - centerX);
-
-                    // Reset line lost counter when line is found
-                    line_lost_counter = 0;
-                    turn_timer = 0; // Reset turn timer when line is found
-
-                    // vẽ contour được chọn
-                    drawContours(bgr, std::vector<std::vector<Point>>{best_contour}, -1, Scalar(0, 255, 0), 2, LINE_AA);
-
-                    // vẽ đường dọc qua centroid trong ROI
-                    cv::line(bgr, Point(cx, ROI_TOP), Point(cx, HEIGHT - 1), Scalar(0, 255, 255), 2, LINE_AA);
-
-                    // đánh dấu centroid
-                    cv::circle(bgr, Point(cx, cy), 6, Scalar(0, 0, 255), -1, LINE_AA);
-                    
-                    // Vẽ text hiển thị error
-                    char error_text[64];
-                    snprintf(error_text, sizeof(error_text), "ERR: %d", (int)err);
-                    putText(bgr, error_text, Point(cx + 10, cy - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 0), 1, LINE_AA);
-
-                    // vẽ minAreaRect (giúp nhìn hướng của vạch)
-                    RotatedRect rr = minAreaRect(best_contour);
-                    Point2f verts[4];
-                    rr.points(verts);
-                    for (int i = 0; i < 4; ++i)
-                        line(bgr, verts[i], verts[(i + 1) % 4], Scalar(0, 180, 255), 1, LINE_AA);
-
-                    // Tính motor speeds từ PID controller
-                    std::pair<float, float> motor_speeds = follower.update(cx, centerX);
-                    vL = motor_speeds.first;
-                    vR = motor_speeds.second;
-                    
-                    // Giới hạn tốc độ để robot không đi quá nhanh
-                    float max_speed = 0.3f;
-                    vL = std::max(-max_speed, std::min(max_speed, vL));
-                    vR = std::max(-max_speed, std::min(max_speed, vR));
-
-                    // in thông tin lỗi & tốc độ
-                    char buf[128];
-                    snprintf(buf, sizeof(buf), "cx=%d cy=%d err=%.1f vL=%.2f vR=%.2f", cx, cy, err, vL, vR);
-                    putText(bgr, buf, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(50, 220, 50), 2, LINE_AA);
-
-                    std::cout << "FOLLOW; CX=" << cx << " ERR=" << int(err)
-                              << " | MOTOR L=" << vL << " R=" << vR << std::endl;
+                    circle(bgr, Point(cx, cy), 5, Scalar(255, 0, 0), -1); // Blue dot
                 }
-                else {
-                    // Contour quá nhỏ
-                    line_lost_counter++;
-                    std::cout << "CONTOUR_SMALL; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD << std::endl;
-                }
-            }
-            else {
-                // Không có contour phù hợp
-                line_lost_counter++;
-                std::cout << "NO_VALID_CONTOUR; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD << std::endl;
             }
         }
         
-                }
-        
-        // Xử lý turn logic khi lost line
-        if (line_lost_counter >= TURN_THRESHOLD)
-        {
-            // Turn to search for line
-            turn_timer++;
-            if (turn_timer >= MAX_TURN_TIME)
-            {
-                // Switch turn direction after max turn time
-                turn_direction = -turn_direction;
-                turn_timer = 0;
-                std::cout << "SWITCHING TURN DIRECTION TO " << (turn_direction > 0 ? "LEFT" : "RIGHT") << std::endl;
-            }
+        if (lines.found_lines) {
+            // Draw detected black lines in green
+            cv::line(bgr, Point(lines.left_line_x, ROI_TOP), Point(lines.left_line_x, HEIGHT-1), Scalar(0, 255, 0), 3);
+            cv::line(bgr, Point(lines.right_line_x, ROI_TOP), Point(lines.right_line_x, HEIGHT-1), Scalar(0, 255, 0), 3);
             
-            vL = -turn_direction * TURN_SPEED;
-            vR = turn_direction * TURN_SPEED;
-            std::cout << "SEARCHING; TURN=" << (turn_direction > 0 ? "LEFT" : "RIGHT")
-                      << " TIMER=" << turn_timer << "/" << MAX_TURN_TIME
-                      << " | MOTOR " << vL << " " << vR << "
-";
-        }
-        else if (line_lost_counter > 0 && contours.empty())
-        {
-            // Brief pause before turning
-            vL = 0.0f;
-            vR = 0.0f;
-            std::cout << "PAUSE; COUNTER=" << line_lost_counter << "/" << TURN_THRESHOLD
-                      << " | MOTOR " << vL << " " << vR << "
-";
+            // Draw virtual middle line (between black lines) in magenta
+            cv::line(bgr, Point(lines.virtual_middle_line, ROI_TOP), Point(lines.virtual_middle_line, HEIGHT-1), Scalar(255, 0, 255), 3);
+            
+            // Label the lines
+            putText(bgr, "LEFT BLACK", Point(lines.left_line_x - 30, ROI_TOP - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 2);
+            putText(bgr, "RIGHT BLACK", Point(lines.right_line_x - 30, ROI_TOP - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 2);
+            putText(bgr, "VML", Point(lines.virtual_middle_line - 15, ROI_TOP - 30), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 0, 255), 2);
+            
+            // Draw warning indicators
+            if (lines.too_close_to_left) {
+                putText(bgr, "TOO CLOSE TO LEFT BLACK LINE", Point(10, 60), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
+            }
+            if (lines.too_close_to_right) {
+                putText(bgr, "TOO CLOSE TO RIGHT BLACK LINE", Point(10, 90), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
+            }
+        } else {
+            // No black lines detected
+            putText(bgr, "NO BLACK LINES DETECTED", Point(10, 60), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 0, 255), 2);
         }
 
-        // Send vL and vR to motors
+        // Display status
+        char status_buf[256];
+        snprintf(status_buf, sizeof(status_buf), "STATE: %s | Time: %.1fs | vL=%.2f vR=%.2f", 
+                state_name.c_str(), state_duration, vL, vR);
+        putText(bgr, status_buf, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
+
+        if (in_correction) {
+            char corr_buf[128];
+            snprintf(corr_buf, sizeof(corr_buf), "CORRECTING: %s wheel for %.1fs", 
+                    correcting_right_wheel ? "RIGHT" : "LEFT", correction_duration);
+            putText(bgr, corr_buf, Point(10, 120), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 2);
+        }
+
+        // ==================== Motor Control ====================
         if (uart_fd >= 0)
         {
             drive_motors(uart_fd, vL, vR);
         }
         else
         {
-            // Simulation mode - just print values
-            std::cout << "[SIMULATION] MOTOR " << vL << " " << vR << std::endl;
+            std::cout << "[" << state_name << "] MOTOR L=" << vL << " R=" << vR << std::endl;
         }
 
-        imshow("mask", mask);
-        imshow("color", bgr);
-        imshow("gray", gray);           // Để xem grayscale
-        imshow("adaptive", thresh);     // Để xem adaptive threshold
-        imshow("edges", edges);         // Để xem edge detection
+        // ==================== Display ====================
+        imshow("Robot View", bgr);
+        imshow("Black Line Mask", mask);    // Show detected black pixels
+        imshow("Gray", gray);               // Show grayscale image
 
-        if (waitKey(1) == 27)
+        if (waitKey(1) == 27) // ESC key
         {
             break;
         }
@@ -429,44 +592,7 @@ try
     // Stop motors and close UART
     if (uart_fd >= 0)
     {
-        drive_motors(uart_fd, 0.0f, 0.0f); // Stop motors
-        close(uart_fd);
-        std::cout << "Motors stopped and UART closed." << std::endl;
-    }
-
-    pipe.stop();
-    return 0;
-        }
-
-        // Send vL and vR to motors
-        if (uart_fd >= 0)
-        {
-            drive_motors(uart_fd, vL, vR);
-        }
-        else
-        {
-            // Simulation mode - just print values
-            std::cout << "[SIMULATION] MOTOR " << vL << " " << vR << std::endl;
-        }
-
-        imshow("mask", mask);
-        imshow("color", bgr);
-        imshow("gray", gray);           // Để xem grayscale
-        imshow("adaptive", thresh);     // Để xem adaptive threshold
-        imshow("edges", edges);         // Để xem edge detection
-
-        if (waitKey(1) == 27)
-        {
-            break;
-        }
-
-        std::this_thread::sleep_until(next_tick);
-    }
-
-    // Stop motors and close UART
-    if (uart_fd >= 0)
-    {
-        drive_motors(uart_fd, 0.0f, 0.0f); // Stop motors
+        drive_motors(uart_fd, 0.0f, 0.0f);
         close(uart_fd);
         std::cout << "Motors stopped and UART closed." << std::endl;
     }
