@@ -108,9 +108,9 @@ void send_motor_command(int fd, const char *id, float speed)
 void drive_motors(int fd, float left_speed, float right_speed)
 {
     // Nếu robot đi sai hướng, đổi M1 và M2:
-    send_motor_command(fd, "M2", left_speed);   // M2 = bánh trái
-    send_motor_command(fd, "M1", -right_speed);  // M1 = bánh phải
-    
+    send_motor_command(fd, "M1", left_speed);   // M1 = bánh trái
+    send_motor_command(fd, "M2", right_speed);  // M2 = bánh phải
+
     // Nếu cần đảo chiều, uncomment dòng dưới:
     // send_motor_command(fd, "M2", -left_speed);
     // send_motor_command(fd, "M1", -right_speed);
@@ -131,11 +131,11 @@ enum class RobotState {
 // ==================== FSM Configuration ====================
 struct FSMConfig {
     // Time durations for each state (in seconds)
-    float straight1_duration = 300.0f;    // First straight: 30 seconds
-    float turn_left_duration = 15.0f;    // Turn left: 15 seconds
-    float straight2_duration = 20.0f;    // Second straight: 20 seconds
-    float turn_right_duration = 15.0f;   // Turn right: 15 seconds
-    float straight3_duration = 30.0f;    // Third straight: 30 seconds
+    float straight1_duration = 8.0f;    // First straight: 8 seconds
+    float turn_left_duration = 1.0f;    // Turn left: 1 second
+    float straight2_duration = 10.0f;    // Second straight: 10 seconds
+    float turn_right_duration = 1.0f;   // Turn right: 1 second
+    float straight3_duration = 2.0f;    // Third straight: 30 seconds
 
     // Speed settings
     float max_speed = 0.5f;              // Max speed (maps to 255 PWM)
