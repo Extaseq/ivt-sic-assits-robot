@@ -378,9 +378,9 @@ try
                 state_name = "TURN_LEFT_90";
                 should_transition = (state_duration >= config.turn_left_duration);
                 
-                // Turn left: left wheel slower, right wheel faster
-                vL = -config.turn_speed;
-                vR = config.turn_speed;
+                // FIXED: Swap the motor speeds to actually turn left
+                vL = config.turn_speed;   // Left wheel forward
+                vR = -config.turn_speed;  // Right wheel backward
                 
                 if (should_transition) {
                     current_state = RobotState::GO_STRAIGHT_2;
@@ -428,9 +428,9 @@ try
                 state_name = "TURN_RIGHT_90";
                 should_transition = (state_duration >= config.turn_right_duration);
                 
-                // Turn right: left wheel faster, right wheel slower
-                vL = config.turn_speed;
-                vR = -config.turn_speed;
+                // FIXED: Swap the motor speeds to actually turn right
+                vL = -config.turn_speed;  // Left wheel backward
+                vR = config.turn_speed;   // Right wheel forward
                 
                 if (should_transition) {
                     current_state = RobotState::GO_STRAIGHT_3;
