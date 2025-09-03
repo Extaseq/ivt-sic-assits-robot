@@ -345,21 +345,21 @@ try
                     float steering_gain = 0.003f; // Adjust this value to tune response
                     float correction = error * steering_gain;
                     
-                    // Apply correction to motor speeds
-                    if (error > config.vml_right_threshold) {
-                        // Line is too far right - turn right (reduce left wheel)
-                        vL = config.max_speed * config.speed_reduction;
-                        std::cout << "TURNING RIGHT: Line at " << lines.virtual_middle_line << ", error=" << error << std::endl;
-                    }
-                    else if (error < -config.vml_left_threshold) {
-                        // Line is too far left - turn left (reduce right wheel)  
-                        vR = config.max_speed * config.speed_reduction;
-                        std::cout << "TURNING LEFT: Line at " << lines.virtual_middle_line << ", error=" << error << std::endl;
-                    }
-                    else {
-                        // Line is close to center - go straight
-                        std::cout << "GOING STRAIGHT: Line at " << lines.virtual_middle_line << ", error=" << error << std::endl;
-                    }
+                    // // Apply correction to motor speeds
+                    // if (error > config.vml_right_threshold) {
+                    //     // Line is too far right - turn right (reduce left wheel)
+                    //     vL = config.max_speed * config.speed_reduction;
+                    //     std::cout << "TURNING RIGHT: Line at " << lines.virtual_middle_line << ", error=" << error << std::endl;
+                    // }
+                    // else if (error < -config.vml_left_threshold) {
+                    //     // Line is too far left - turn left (reduce right wheel)  
+                    //     vR = config.max_speed * config.speed_reduction;
+                    //     std::cout << "TURNING LEFT: Line at " << lines.virtual_middle_line << ", error=" << error << std::endl;
+                    // }
+                    // else {
+                    //     // Line is close to center - go straight
+                    //     std::cout << "GOING STRAIGHT: Line at " << lines.virtual_middle_line << ", error=" << error << std::endl;
+                    // }
                 } else {
                     // No lines detected - just go straight
                     vL = vR = config.max_speed;
