@@ -131,11 +131,11 @@ enum class RobotState {
 // ==================== FSM Configuration ====================
 struct FSMConfig {
     // Time durations for each state (in seconds)
-    float straight1_duration = 8.0f;    // First straight: 8 seconds
-    float turn_left_duration = 1.0f;    // Turn left: 1 second
-    float straight2_duration = 10.0f;    // Second straight: 10 seconds
+    float straight1_duration = 6.5f;    // First straight: 6.5 seconds
+    float turn_left_duration = 0.8f;    // Turn left: 0.8 seconds
+    float straight2_duration = 7.2f;    // Second straight: 7.2 seconds
     float turn_right_duration = 1.0f;   // Turn right: 1 second
-    float straight3_duration = 2.0f;    // Third straight: 30 seconds
+    float straight3_duration = 2.0f;    // Third straight: 2 seconds
 
     // Speed settings
     float max_speed = 0.7f;              // Max speed (maps to 255 PWM)
@@ -339,7 +339,8 @@ try
                     int error = lines.virtual_middle_line - center_x;
                     
                     // Base speed
-                    vL = vR = config.max_speed;
+                    vL = config.max_speed;
+                    vR = config.max_speed * 0.9f;
                     
                     // Apply proportional steering correction
                     float steering_gain = 0.003f; // Adjust this value to tune response
@@ -362,7 +363,8 @@ try
                     // }
                 } else {
                     // No lines detected - just go straight
-                    vL = vR = config.max_speed;
+                    vL = config.max_speed;
+                    vR = config.max_speed * 0.9f;
                     std::cout << "NO LINE DETECTED - GOING STRAIGHT" << std::endl;
                 }
                 
