@@ -138,7 +138,7 @@ struct FSMConfig {
     float straight3_duration = 2.0f;    // Third straight: 30 seconds
 
     // Speed settings
-    float max_speed = 0.5f;              // Max speed (maps to 255 PWM)
+    float max_speed = 0.7f;              // Max speed (maps to 255 PWM)
     float turn_speed = 0.6f;             // Turn speed
     float speed_reduction = 0.7f;        // Speed when correcting (70% of max)
     float correction_duration = 0.5f;    // Correction duration in seconds
