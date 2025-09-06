@@ -389,6 +389,8 @@ try
     int capture_debounce = 0;              // frames to avoid double count
     const float BALL_DETECT_MAX = 3.0f;    // meters
     const float BALL_CAPTURE_DIST = 0.35f; // meters threshold to count
+    bool enable_ball_detection = false;    // becomes true only after finishing STRAIGHT_3
+    bool line_mission_done = false;        // set when STRAIGHT_3 duration elapsed
 
     while (true)
     {
@@ -449,20 +451,25 @@ try
 
         Mat mask = black_mask.clone();
 
-        // ==================== Ball Detection ====================
-        BallDetectionResult ball = detectBall(bgr, depth_mat, fx, ppx, depth_scale);
-        bool ball_valid = ball.found && ball.distance_m > 0.f && ball.distance_m <= BALL_DETECT_MAX;
-        if (ball_valid && balls_collected < BALL_TARGET)
-            intake_latched = true; // latch intake
-        if (capture_debounce > 0)
-            capture_debounce--;
-        if (ball_valid && ball.distance_m <= BALL_CAPTURE_DIST && balls_collected < BALL_TARGET && capture_debounce == 0)
+        // ==================== Ball Detection (gated) ====================
+        BallDetectionResult ball; // default empty
+        bool ball_valid = false;
+        if (enable_ball_detection)
         {
-            balls_collected++;
-            capture_debounce = 20; // ~0.4s at 50Hz
-            std::cout << "Ball collected (#" << balls_collected << ") Z=" << ball.distance_m << std::endl;
-            if (balls_collected >= BALL_TARGET)
-                intake_latched = false; // allow off
+            ball = detectBall(bgr, depth_mat, fx, ppx, depth_scale);
+            ball_valid = ball.found && ball.distance_m > 0.f && ball.distance_m <= BALL_DETECT_MAX;
+            if (ball_valid && balls_collected < BALL_TARGET)
+                intake_latched = true; // latch intake only in ball mode
+            if (capture_debounce > 0)
+                capture_debounce--;
+            if (ball_valid && ball.distance_m <= BALL_CAPTURE_DIST && balls_collected < BALL_TARGET && capture_debounce == 0)
+            {
+                balls_collected++;
+                capture_debounce = 20; // ~0.4s at 50Hz
+                std::cout << "Ball collected (#" << balls_collected << ") Z=" << ball.distance_m << std::endl;
+                if (balls_collected >= BALL_TARGET)
+                    intake_latched = false; // allow off
+            }
         }
 
         // ==================== Line Detection ====================
@@ -633,17 +640,18 @@ try
                 std::cout << "NO LINE DETECTED - GOING STRAIGHT" << std::endl;
             }
 
-            if (should_transition)
+            if (should_transition && !line_mission_done)
             {
-                // Mission complete - stop or restart
+                line_mission_done = true;
+                enable_ball_detection = true; // now allow ball detection
                 vL = vR = 0.0f;
-                std::cout << "MISSION COMPLETE! Stopping robot." << std::endl;
+                std::cout << "LINE MISSION COMPLETE. START BALL COLLECTION MODE." << std::endl;
             }
             break;
         }
 
-        // Override: approach ball if present and not finished
-        if (balls_collected < BALL_TARGET && ball_valid)
+        // Override: approach ball if present and not finished (only when detection enabled)
+        if (enable_ball_detection && balls_collected < BALL_TARGET && ball_valid)
         {
             float ang_norm = 25.0f * (float)CV_PI / 180.0f;
             float steer = std::clamp(ball.angle_rad / ang_norm, -1.0f, 1.0f);
@@ -651,7 +659,7 @@ try
             vL = std::clamp(fwd - 0.6f * steer, -0.8f, 0.8f);
             vR = std::clamp(fwd + 0.6f * steer, -0.8f, 0.8f);
         }
-        if (balls_collected >= BALL_TARGET)
+        if (enable_ball_detection && balls_collected >= BALL_TARGET)
         {
             vL = vR = 0.0f;
         }
@@ -802,12 +810,16 @@ try
         {
             putText(bgr, "BallDist: --", Point(10, 300), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
         }
-        if (intake_latched && balls_collected < BALL_TARGET)
+        if (enable_ball_detection && intake_latched && balls_collected < BALL_TARGET)
             putText(bgr, "INTAKE ON", Point(10, 330), FONT_HERSHEY_SIMPLEX, 0.55, Scalar(0, 255, 255), 2);
+        if (!enable_ball_detection)
+            putText(bgr, "BALL MODE: WAITING (finish STRAIGHT_3)", Point(10, 360), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(200, 200, 200), 1);
+        else if (balls_collected >= BALL_TARGET)
+            putText(bgr, "BALL MODE: COMPLETE", Point(10, 360), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 1);
 
         imshow("Robot View", bgr);
-        imshow("Black Line Mask", mask); // Show detected black pixels
-        imshow("Gray", gray);            // Show grayscale image
+        // imshow("Black Line Mask", mask); // Show detected black pixels
+        // imshow("Gray", gray);            // Show grayscale image
 
         if (waitKey(1) == 27) // ESC key
         {
