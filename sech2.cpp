@@ -4,14 +4,13 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <cmath>
 #include "LineFollow.hpp"
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
-#include "BallDetection.hpp"
 
 using namespace cv;
-using namespace ball;
 
 #define REALSENSE_ERROR 1
 #define STD_ERROR 2
@@ -120,7 +119,86 @@ void drive_motors(int fd, float left_speed, float right_speed)
 
 void set_intake(int fd, int power)
 {
-    send_motor_command(fd, "M3", power / 255.0f); // Assuming power is PWM value
+    send_motor_command(fd, "M3", power);
+}
+
+// ==================== Ball Detection ====================
+struct BallResult
+{
+    bool found = false;
+    int center_x = 0;
+    int center_y = 0;
+    int radius = 0;
+    float distance = 0.0f;
+    float angle = 0.0f;
+    float score = 0.0f;
+};
+
+BallResult detect_ball(const Mat &frame, const Mat &depth_frame,
+                       float fx, float ppx, float depth_scale)
+{
+    BallResult result;
+
+    // Convert to HSV for color detection
+    Mat hsv;
+    cvtColor(frame, hsv, COLOR_BGR2HSV);
+
+    // Tennis ball color range (yellow-green)
+    Scalar lower_bound(20, 80, 120);
+    Scalar upper_bound(45, 255, 255);
+
+    Mat mask;
+    inRange(hsv, lower_bound, upper_bound, mask);
+
+    // Morphological operations
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(5, 5));
+    morphologyEx(mask, mask, MORPH_CLOSE, kernel);
+    morphologyEx(mask, mask, MORPH_OPEN, kernel);
+
+    // Find contours
+    vector<vector<Point>> contours;
+    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+    if (!contours.empty())
+    {
+        // Find largest contour
+        auto largest_contour = *max_element(contours.begin(), contours.end(),
+                                            [](const vector<Point> &a, const vector<Point> &b)
+                                            {
+                                                return contourArea(a) < contourArea(b);
+                                            });
+
+        // Fit circle
+        Point2f center;
+        float radius;
+        minEnclosingCircle(largest_contour, center, radius);
+
+        if (radius > 10)
+        {
+            result.found = true;
+            result.center_x = static_cast<int>(center.x);
+            result.center_y = static_cast<int>(center.y);
+            result.radius = static_cast<int>(radius);
+
+            // Calculate distance from depth
+            if (depth_frame.empty() == false)
+            {
+                uint16_t depth_value = depth_frame.at<uint16_t>(
+                    static_cast<int>(center.y), static_cast<int>(center.x));
+                result.distance = depth_value * depth_scale;
+
+                // Calculate angle
+                result.angle = atan2(center.x - ppx, fx);
+            }
+
+            // Simple scoring based on circularity
+            double area = contourArea(largest_contour);
+            double circularity = (4 * CV_PI * area) / (arcLength(largest_contour, true) * arcLength(largest_contour, true));
+            result.score = static_cast<float>(circularity);
+        }
+    }
+
+    return result;
 }
 
 static const int WIDTH = 640, HEIGHT = 480, FPS = 30;
@@ -251,19 +329,6 @@ try
     cfg.enable_stream(RS2_STREAM_DEPTH, WIDTH, HEIGHT, RS2_FORMAT_Z16, FPS);
     auto profile = pipe.start(cfg);
 
-    // Get intrinsics and depth scale for ball detection
-    auto color_profile = profile.get_stream(RS2_STREAM_COLOR).as<rs2::video_stream_profile>();
-    rs2_intrinsics intrinsics = color_profile.get_intrinsics();
-    float fx = intrinsics.fx, ppx = intrinsics.ppx;
-    auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
-    float depth_scale = depth_sensor.get_depth_scale();
-
-    // Initialize ball detector
-    ball::Params ball_params;
-    ball_params.roi_top_frac = 0.2f;
-    ball_params.enable_lock = true;
-    ball::Detector ball_det(ball_params);
-
     int centerX = WIDTH / 2;
 
     // Mở kết nối UART để điều khiển động cơ
@@ -291,8 +356,7 @@ try
 
     // Ball collection variables
     int balls_collected = 0;
-    bool intake_on = false;
-    auto intake_start_time = std::chrono::steady_clock::now();
+    bool intake_active = false;
 
     std::cout << "FSM Line Following Robot Started!" << std::endl;
     std::cout << "States: STRAIGHT1 -> TURN_LEFT -> STRAIGHT2 -> TURN_RIGHT -> STRAIGHT3" << std::endl;
@@ -322,15 +386,27 @@ try
         }
 
         rs2::video_frame color = fs.get_color_frame();
-        rs2::depth_frame depth = fs.get_depth_frame();
         if (!color)
         {
             std::this_thread::sleep_until(next_tick);
             continue;
         }
 
+        rs2::frame depth_frame = fs.get_depth_frame();
+        if (!depth_frame)
+        {
+            std::this_thread::sleep_until(next_tick);
+            continue;
+        }
+
         Mat bgr(Size(WIDTH, HEIGHT), CV_8UC3, (void *)color.get_data(), Mat::AUTO_STEP);
-        Mat depth_mat(Size(WIDTH, HEIGHT), CV_16UC1, (void *)depth.get_data(), Mat::AUTO_STEP);
+        Mat depth_image(Size(WIDTH, HEIGHT), CV_16UC1, (void *)depth_frame.get_data(), Mat::AUTO_STEP);
+
+        auto color_profile = profile.get_stream(RS2_STREAM_COLOR).as<rs2::video_stream_profile>();
+        rs2_intrinsics intrinsics = color_profile.get_intrinsics();
+        float fx = intrinsics.fx, ppx = intrinsics.ppx;
+        auto depth_sensor = profile.get_device().first<rs2::depth_sensor>();
+        float depth_scale = depth_sensor.get_depth_scale();
 
         // Draw reference lines
         cv::line(bgr, Point(WIDTH / 2, 0), Point(WIDTH / 2, HEIGHT - 1), Scalar(255, 255, 0), 1, LINE_AA);
@@ -360,11 +436,52 @@ try
         Mat mask = black_mask.clone();
 
         // ==================== Ball Detection ====================
-        std::vector<ball::Candidate> ball_candidates;
-        ball::Result ball_result = ball_det.detect(bgr, depth_mat, fx, ppx, depth_scale, &ball_candidates);
+        BallResult ball = detect_ball(bgr, depth_image, fx, ppx, depth_scale);
 
         // ==================== Line Detection ====================
         LineDetection lines = detect_two_white_lines(mask, config);
+
+        // ==================== Ball Detection and Intake Logic ====================
+        if (ball.found && ball.distance > 0 && ball.distance < 3.0f)
+        {
+            if (!intake_active)
+            {
+                intake_active = true;
+                if (uart_fd >= 0)
+                    set_intake(uart_fd, 255);
+                std::cout << "INTAKE ACTIVATED: Ball at " << ball.distance << "m" << std::endl;
+            }
+            // Approach ball
+            float omega = ball.angle / (25.0f * CV_PI / 180.0f);
+            float fwd = (ball.distance - 0.2f) * 2.0f;
+            vL = fwd - 0.7f * omega;
+            vR = fwd + 0.7f * omega;
+        }
+        else
+        {
+            if (intake_active)
+            {
+                intake_active = false;
+                if (uart_fd >= 0)
+                    set_intake(uart_fd, 0);
+                std::cout << "INTAKE DEACTIVATED" << std::endl;
+            }
+        }
+
+        // Check if ball is collected (close enough)
+        if (ball.found && ball.distance > 0 && ball.distance < 0.3f)
+        {
+            balls_collected++;
+            std::cout << "BALL COLLECTED! Total: " << balls_collected << std::endl;
+            // Reset ball detection to avoid multiple counts
+            ball.found = false;
+        }
+
+        if (balls_collected >= 3)
+        {
+            std::cout << "MISSION COMPLETE: 3 balls collected!" << std::endl;
+            break;
+        }
 
         // ==================== FSM State Machine ====================
         float vL = 0.0f, vR = 0.0f;
@@ -540,33 +657,6 @@ try
             break;
         }
 
-        // ==================== Ball Collection Logic ====================
-        if (ball_result.found && ball_result.distance_m > 0 && ball_result.distance_m < 3.0f)
-        {
-            if (!intake_on)
-            {
-                intake_on = true;
-                intake_start_time = current_time;
-                std::cout << "Ball detected within 3m, turning on intake." << std::endl;
-            }
-        }
-
-        if (intake_on)
-        {
-            auto intake_duration = std::chrono::duration<float>(current_time - intake_start_time).count();
-            if (intake_duration > 2.0f)
-            { // Assume ball collected after 2 seconds
-                balls_collected++;
-                intake_on = false;
-                std::cout << "Ball collected! Total: " << balls_collected << std::endl;
-                if (balls_collected >= 3)
-                {
-                    vL = vR = 0.0f;
-                    std::cout << "Collected 3 balls, stopping robot." << std::endl;
-                }
-            }
-        }
-
         // ==================== Visual Feedback ====================
 
         // Draw all detected black line contours for debugging
@@ -673,17 +763,17 @@ try
                  state_name.c_str(), state_duration, vL, vR);
         putText(bgr, status_buf, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(255, 255, 255), 2);
 
-        // Display ball info
-        char ball_buf[256];
-        if (ball_result.found)
+        // Ball info
+        putText(bgr, "Balls collected: " + std::to_string(balls_collected), Point(10, 60), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 0), 2);
+        if (ball.found)
         {
-            snprintf(ball_buf, sizeof(ball_buf), "Balls collected: %d\nDistance to nearest ball: %.2fm", balls_collected, ball_result.distance_m);
+            putText(bgr, "Nearest ball distance: " + std::to_string(ball.distance) + "m", Point(10, 90), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 0), 2);
+            circle(bgr, Point(ball.center_x, ball.center_y), ball.radius, Scalar(0, 255, 0), 2);
         }
         else
         {
-            snprintf(ball_buf, sizeof(ball_buf), "Balls collected: %d\nNo ball detected", balls_collected);
+            putText(bgr, "No ball detected", Point(10, 90), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(255, 255, 0), 2);
         }
-        putText(bgr, ball_buf, Point(10, 60), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 255, 0), 2);
 
         if (in_correction)
         {
@@ -697,11 +787,10 @@ try
         if (uart_fd >= 0)
         {
             drive_motors(uart_fd, vL, vR);
-            set_intake(uart_fd, intake_on ? 255 : 0);
         }
         else
         {
-            std::cout << "[" << state_name << "] MOTOR L=" << vL << " R=" << vR << " INTAKE=" << (intake_on ? "ON" : "OFF") << std::endl;
+            std::cout << "[" << state_name << "] MOTOR L=" << vL << " R=" << vR << std::endl;
         }
 
         // ==================== Display ====================
@@ -721,7 +810,6 @@ try
     if (uart_fd >= 0)
     {
         drive_motors(uart_fd, 0.0f, 0.0f);
-        set_intake(uart_fd, 0);
         close(uart_fd);
         std::cout << "Motors stopped and UART closed." << std::endl;
     }
